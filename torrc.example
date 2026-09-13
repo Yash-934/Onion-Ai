@@ -1,0 +1,4 @@
+# Example server-side Tor v3 onion service.
+# Keep the service bound to localhost; do not expose the backend directly.
+HiddenServiceDir /var/lib/tor/private-ai/
+HiddenServicePort 443 127.0.0.1:8443

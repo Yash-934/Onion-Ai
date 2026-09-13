@@ -55,7 +55,8 @@ class SecureStore(private val ctx: Context) {
     }
 
     fun get(name: String): String? = runCatching {
-        val raw = Base64.decode(prefs.getString(name, null), Base64.NO_WRAP)
+        val str = prefs.getString(name, null) ?: return null
+        val raw = Base64.decode(str, Base64.NO_WRAP)
         val iv = raw.copyOfRange(0, 12)
         val data = raw.copyOfRange(12, raw.size)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -67,29 +68,102 @@ class SecureStore(private val ctx: Context) {
 class ApiClient(private val baseUrl: String, private val apiKey: String, private val socksPort: Int) {
     private fun open(url: String, method: String): HttpURLConnection {
         val u = URL(url)
-        require(u.protocol == "http" || u.protocol == "https") { "Unsupported URL scheme" }
-        require(u.host.endsWith(".onion", true)) { "Tor-only mode: endpoint must be a .onion host" }
+        require(u.protocol.equals("http", true) || u.protocol.equals("https", true)) { "Unsupported URL scheme: ${u.protocol}" }
+        val host = u.host ?: ""
+        require(host.endsWith(".onion", ignoreCase = true)) {
+            "Tor-only security violation: '$host' is not a .onion hidden service. Clear-net connections are strictly rejected."
+        }
         val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort))
         return (u.openConnection(proxy) as HttpURLConnection).apply {
             requestMethod = method
             connectTimeout = 15000
             readTimeout = 60000
-            setRequestProperty("Accept", "application/json")
-            setRequestProperty("Authorization", "Bearer $apiKey")
+            setRequestProperty("Accept", "application/json, text/event-stream")
+            if (apiKey.isNotBlank()) {
+                setRequestProperty("Authorization", "Bearer $apiKey")
+                setRequestProperty("x-api-key", apiKey)
+            }
             setRequestProperty("Content-Type", "application/json")
         }
     }
 
     fun models(): List<String> {
-        val c = open(baseUrl.trimEnd('/') + "/models", "GET")
-        val body = c.inputStream.bufferedReader().use { it.readText() }
-        c.disconnect()
-        val arr = JSONObject(body).optJSONArray("data") ?: JSONArray()
-        return (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.optString("id")?.takeIf(String::isNotBlank) }
+        val base = baseUrl.trimEnd('/')
+        val endpoints = listOf("$base/v1/models", "$base/models")
+        var lastErr: Exception? = null
+
+        for (endpoint in endpoints) {
+            try {
+                val c = open(endpoint, "GET")
+                val body = c.inputStream.bufferedReader().use { it.readText() }
+                c.disconnect()
+                val arr = JSONObject(body).optJSONArray("data") ?: JSONArray()
+                val list = (0 until arr.length()).mapNotNull {
+                    arr.optJSONObject(it)?.optString("id")?.takeIf(String::isNotBlank)
+                }
+                if (list.isNotEmpty()) return list
+            } catch (e: Exception) {
+                lastErr = e
+            }
+        }
+        throw (lastErr ?: IOException("No models found"))
     }
 
     fun chat(model: String, messages: List<ChatMessage>, onToken: (String) -> Unit): String {
-        val c = open(baseUrl.trimEnd('/') + "/chat/completions", "POST")
+        val base = baseUrl.trimEnd('/')
+        // Try Anthropic /v1/messages first, fall back to /chat/completions
+        return try {
+            chatAnthropicMessages(base, model, messages, onToken)
+        } catch (e: Exception) {
+            chatOpenAiCompletions(base, model, messages, onToken)
+        }
+    }
+
+    private fun chatAnthropicMessages(base: String, model: String, messages: List<ChatMessage>, onToken: (String) -> Unit): String {
+        val c = open("$base/v1/messages", "POST")
+        c.doOutput = true
+        val body = JSONObject()
+            .put("model", model)
+            .put("stream", true)
+            .put("max_tokens", 4096)
+            .put("messages", JSONArray().apply {
+                messages.forEach { put(JSONObject().put("role", it.role).put("content", it.content)) }
+            }).toString()
+
+        c.outputStream.use { it.write(body.toByteArray()) }
+        if (c.responseCode !in 200..299) {
+            val err = c.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            c.disconnect()
+            error("HTTP ${c.responseCode}: $err")
+        }
+
+        val out = StringBuilder()
+        c.inputStream.bufferedReader().useLines { lines ->
+            lines.forEach { line ->
+                val trimmed = line.trim()
+                if (!trimmed.startsWith("data:")) return@forEach
+                val payload = trimmed.removePrefix("data:").trim()
+                if (payload == "[DONE]") return@forEach
+                runCatching {
+                    val obj = JSONObject(payload)
+                    val type = obj.optString("type")
+                    if (type == "content_block_delta") {
+                        val delta = obj.optJSONObject("delta")
+                        val text = delta?.optString("text").orEmpty()
+                        if (text.isNotEmpty()) {
+                            out.append(text)
+                            onToken(text)
+                        }
+                    }
+                }
+            }
+        }
+        c.disconnect()
+        return out.toString()
+    }
+
+    private fun chatOpenAiCompletions(base: String, model: String, messages: List<ChatMessage>, onToken: (String) -> Unit): String {
+        val c = open("$base/chat/completions", "POST")
         c.doOutput = true
         val body = JSONObject()
             .put("model", model)
@@ -97,23 +171,29 @@ class ApiClient(private val baseUrl: String, private val apiKey: String, private
             .put("messages", JSONArray().apply {
                 messages.forEach { put(JSONObject().put("role", it.role).put("content", it.content)) }
             }).toString()
+
         c.outputStream.use { it.write(body.toByteArray()) }
         if (c.responseCode !in 200..299) {
             val err = c.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
             c.disconnect()
             error("HTTP ${c.responseCode}: $err")
         }
+
         val out = StringBuilder()
         c.inputStream.bufferedReader().useLines { lines ->
             lines.forEach { line ->
-                if (!line.startsWith("data:")) return@forEach
-                val payload = line.removePrefix("data:").trim()
+                val trimmed = line.trim()
+                if (!trimmed.startsWith("data:")) return@forEach
+                val payload = trimmed.removePrefix("data:").trim()
                 if (payload == "[DONE]") return@forEach
                 runCatching {
                     val delta = JSONObject(payload).optJSONArray("choices")
                         ?.optJSONObject(0)?.optJSONObject("delta")
                         ?.optString("content").orEmpty()
-                    if (delta.isNotEmpty()) { out.append(delta); onToken(delta) }
+                    if (delta.isNotEmpty()) {
+                        out.append(delta)
+                        onToken(delta)
+                    }
                 }
             }
         }
@@ -122,7 +202,8 @@ class ApiClient(private val baseUrl: String, private val apiKey: String, private
     }
 
     fun image(model: String, prompt: String): ByteArray {
-        val c = open(baseUrl.trimEnd('/') + "/images/generations", "POST")
+        val base = baseUrl.trimEnd('/')
+        val c = open("$base/v1/images/generations", "POST")
         c.doOutput = true
         val body = JSONObject().put("model", model).put("prompt", prompt).put("response_format", "b64_json").toString()
         c.outputStream.use { it.write(body.toByteArray()) }
@@ -152,45 +233,98 @@ class MainActivity : Activity() {
         store = SecureStore(this)
         tts = TextToSpeech(this) { if (it == TextToSpeech.SUCCESS) tts?.language = Locale.getDefault() }
         buildUi()
+        restoreHistory()
         loadConfig()
     }
 
     private fun buildUi() {
-        root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(20,20,20,20) }
+        root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 24, 24, 24) }
         val title = TextView(this).apply {
-            text = "Private AI  •  Tor-only"
-            textSize = 22f; typeface = Typeface.DEFAULT_BOLD
+            text = "Private AI  •  Tor Gateway"
+            textSize = 20f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, 8)
         }
-        status = TextView(this).apply { text = "Not connected"; textSize = 12f }
-        modelSpinner = Spinner(this)
+        status = TextView(this).apply {
+            text = "Not connected"
+            textSize = 13f
+            setPadding(0, 0, 0, 12)
+        }
+        modelSpinner = Spinner(this).apply {
+            setPadding(0, 0, 0, 12)
+        }
         messagesBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val scroll = ScrollView(this).apply { addView(messagesBox) }
-        input = EditText(this).apply { hint = "Message"; minLines = 2; maxLines = 6 }
+        input = EditText(this).apply {
+            hint = "Enter message for AI..."
+            minLines = 2
+            maxLines = 5
+        }
         val send = Button(this).apply { text = "Send" }
-        val settings = Button(this).apply { text = "Custom API / Privacy" }
-        val speak = Button(this).apply { text = "Speak last reply" }
+        val settings = Button(this).apply { text = "Custom API / Tor Config" }
+        val speak = Button(this).apply { text = "Speak Last Reply" }
+        val clear = Button(this).apply { text = "Clear History" }
+
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         bar.addView(send, LinearLayout.LayoutParams(0, -2, 1f))
         bar.addView(speak, LinearLayout.LayoutParams(0, -2, 1f))
-        root.addView(title); root.addView(status); root.addView(modelSpinner)
+
+        val bar2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        bar2.addView(settings, LinearLayout.LayoutParams(0, -2, 1f))
+        bar2.addView(clear, LinearLayout.LayoutParams(0, -2, 1f))
+
+        root.addView(title)
+        root.addView(status)
+        root.addView(modelSpinner)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        root.addView(input); root.addView(bar); root.addView(settings)
+        root.addView(input)
+        root.addView(bar)
+        root.addView(bar2)
         setContentView(root)
+
         send.setOnClickListener { sendMessage() }
         speak.setOnClickListener {
-            messages.lastOrNull { it.role == "assistant" }?.content?.let { tts?.speak(it, TextToSpeech.QUEUE_FLUSH, null, "last") }
+            messages.lastOrNull { it.role == "assistant" }?.content?.let {
+                tts?.speak(it, TextToSpeech.QUEUE_FLUSH, null, "last")
+            }
         }
         settings.setOnClickListener { showSettings() }
+        clear.setOnClickListener {
+            messages.clear()
+            messagesBox.removeAllViews()
+            store.put(KEY_BLOB, "[]")
+            status.text = "History cleared"
+        }
     }
 
     private fun addBubble(text: String, role: String) {
         val v = TextView(this).apply {
             this.text = if (role == "user") "You\n$text" else "AI\n$text"
-            textSize = 16f; setPadding(16,14,16,14)
+            textSize = 15f
+            setPadding(20, 16, 20, 16)
             setBackgroundResource(android.R.drawable.dialog_holo_light_frame)
         }
-        messagesBox.addView(v)
+        val params = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            setMargins(0, 8, 0, 8)
+        }
+        messagesBox.addView(v, params)
         (messagesBox.parent as? ScrollView)?.post { (messagesBox.parent as ScrollView).fullScroll(View.FOCUS_DOWN) }
+    }
+
+    private fun restoreHistory() {
+        val saved = store.get(KEY_BLOB) ?: return
+        runCatching {
+            val arr = JSONArray(saved)
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val role = obj.optString("role", "user")
+                val content = obj.optString("content", "")
+                if (content.isNotEmpty()) {
+                    messages += ChatMessage(role, content)
+                    addBubble(content, role)
+                }
+            }
+        }
     }
 
     private fun sendMessage() {
@@ -200,9 +334,19 @@ class MainActivity : Activity() {
         val model = modelSpinner.selectedItem?.toString().orEmpty()
         if (model.isBlank()) { status.text = "Select a model"; return }
         input.setText("")
-        messages += ChatMessage("user", text); addBubble(text, "user")
-        val aiBubble = TextView(this).apply { this.text = "AI\n"; textSize = 16f; setPadding(16,14,16,14) }
-        messagesBox.addView(aiBubble)
+        messages += ChatMessage("user", text)
+        addBubble(text, "user")
+        val aiBubble = TextView(this).apply {
+            this.text = "AI\n"
+            textSize = 15f
+            setPadding(20, 16, 20, 16)
+            setBackgroundResource(android.R.drawable.dialog_holo_light_frame)
+        }
+        val params = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            setMargins(0, 8, 0, 8)
+        }
+        messagesBox.addView(aiBubble, params)
+
         executor.execute {
             runCatching {
                 val reply = client.chat(model, messages) { token ->
@@ -210,34 +354,48 @@ class MainActivity : Activity() {
                 }
                 messages += ChatMessage("assistant", reply)
                 store.put(KEY_BLOB, JSONArray(messages.map { JSONObject().put("role", it.role).put("content", it.content) }).toString())
-            }.onFailure { e -> runOnUiThread { status.text = "Error: ${e.message}" } }
+            }.onFailure { e ->
+                runOnUiThread { status.text = "Error: ${e.message}" }
+            }
         }
     }
 
     private fun showSettings() {
-        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(20,10,20,10) }
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 16, 24, 16) }
         val url = EditText(this).apply { hint = "https://your-service.onion"; setText(store.get("url").orEmpty()) }
-        val key = EditText(this).apply { hint = "API key (optional)"; setText(store.get("key").orEmpty()); inputType = 0x00000081 }
-        val port = EditText(this).apply { hint = "Tor SOCKS port"; setText(store.get("port") ?: "9050"); inputType = 2 }
+        val key = EditText(this).apply { hint = "Gateway API Key (optional)"; setText(store.get("key").orEmpty()); inputType = 0x00000081 }
+        val port = EditText(this).apply { hint = "Tor SOCKS port (e.g. 9050)"; setText(store.get("port") ?: "9050"); inputType = 2 }
         val note = TextView(this).apply {
-            text = "Strict mode: only .onion endpoints are accepted and requests use SOCKS at 127.0.0.1. No clearnet fallback."
+            text = "Strict Tor Security: Only .onion endpoints are permitted over local SOCKS proxy (127.0.0.1). Clear-net requests are strictly blocked."
+            textSize = 12f
+            setPadding(0, 8, 0, 0)
         }
         box.addView(url); box.addView(key); box.addView(port); box.addView(note)
-        AlertDialog.Builder(this).setTitle("Custom API").setView(box)
+        AlertDialog.Builder(this).setTitle("Custom Onion Gateway").setView(box)
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Connect") { _, _ ->
                 val p = port.text.toString().toIntOrNull() ?: 9050
-                store.put("url", url.text.toString().trim()); store.put("key", key.text.toString())
+                val targetUrl = url.text.toString().trim()
+                val targetKey = key.text.toString().trim()
+                store.put("url", targetUrl)
+                store.put("key", targetKey)
                 store.put("port", p.toString())
-                api = ApiClient(url.text.toString().trim(), key.text.toString(), p)
-                status.text = "Connecting via Tor…"
-                executor.execute {
-                    runCatching { api!!.models() }.onSuccess { models ->
-                        runOnUiThread {
-                            modelSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, models)
-                            status.text = "Connected • ${models.size} model(s)"
+                
+                try {
+                    api = ApiClient(targetUrl, targetKey, p)
+                    status.text = "Connecting via Tor SOCKS..."
+                    executor.execute {
+                        runCatching { api!!.models() }.onSuccess { models ->
+                            runOnUiThread {
+                                modelSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, models)
+                                status.text = "Connected • ${models.size} model(s) available"
+                            }
+                        }.onFailure { e ->
+                            runOnUiThread { status.text = "Connection failed: ${e.message}" }
                         }
-                    }.onFailure { e -> runOnUiThread { status.text = "Connection failed: ${e.message}" } }
+                    }
+                } catch (e: Exception) {
+                    status.text = "Config error: ${e.message}"
                 }
             }.show()
     }
@@ -245,12 +403,16 @@ class MainActivity : Activity() {
     private fun loadConfig() {
         val url = store.get("url").orEmpty()
         if (url.isNotBlank()) {
-            api = ApiClient(url, store.get("key").orEmpty(), store.get("port")?.toIntOrNull() ?: 9050)
-            executor.execute {
-                runCatching { api!!.models() }.onSuccess { models ->
-                    runOnUiThread {
-                        modelSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, models)
-                        status.text = "Connected • ${models.size} model(s)"
+            val key = store.get("key").orEmpty()
+            val port = store.get("port")?.toIntOrNull() ?: 9050
+            runCatching {
+                api = ApiClient(url, key, port)
+                executor.execute {
+                    runCatching { api!!.models() }.onSuccess { models ->
+                        runOnUiThread {
+                            modelSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, models)
+                            status.text = "Connected • ${models.size} model(s) available"
+                        }
                     }
                 }
             }

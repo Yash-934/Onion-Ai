@@ -1,75 +1,161 @@
-# Private AI — App 1
+# Private AI Gateway & Tor Client
 
-A privacy-first Android AI client designed for a separate server-side API gateway.
+A production-ready, privacy-first AI gateway and Android client designed for secure, Tor-routed AI operations and seamless integration with **PocketForge** and **Claude Code** agents.
 
-## What is included
+---
 
-- Android client (Kotlin, no account, no analytics SDKs)
-- Strict `.onion` endpoint validation
-- SOCKS/Tor-only network path (127.0.0.1:9050 by default)
-- No clearnet fallback
-- Encrypted local configuration/history using Android Keystore AES-GCM
-- Streaming OpenAI-compatible `/chat/completions`
-- `/models` discovery
-- `/images/generations` client/server contract
-- On-device Android TTS
-- Separate FastAPI gateway skeleton
-- PocketForge-compatible OpenAI Chat provider contract
+## 🏗️ Architecture
 
-## PocketForge compatibility
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                       Clients Layer                         │
+│                                                             │
+│   ┌──────────────────────────┐   ┌───────────────────────┐  │
+│   │ PocketForge (Claude Code)│   │  Android Tor Client   │  │
+│   │  - Sandboxed Agent       │   │  - Keystore AES-GCM   │  │
+│   │  - Tool Execution Local  │   │  - SOCKS5 Strict Mode │  │
+│   └────────────┬─────────────┘   └───────────┬───────────┘  │
+└────────────────┼─────────────────────────────┼──────────────┘
+                 │ Anthropic /v1/messages      │ .onion SOCKS5
+                 ▼                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Private Onion AI Gateway (FastAPI)             │
+│                                                             │
+│  - Zero Logging: No prompts, responses, or keys persisted   │
+│  - Protocol Adapters: Anthropic ⇄ OpenAI ⇄ Internal Normal  │
+│  - SSE Streaming Translator: Real-time event synthesis      │
+│  - Agent Tool Relay: Safe translation of tools & results    │
+│  - Host Isolation: Bound to 127.0.0.1 (behind Tor v3 HS)   │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ Private Upstream Credentials
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 Upstream Model Provider                     │
+│      (Anthropic Claude, OpenAI, or Self-Hosted LLM)         │
+└─────────────────────────────────────────────────────────────┘
+```
 
-PocketForge's OpenAI Chat provider expects:
+> **Standalone Server**: The gateway runs as a standalone server-side API. The Android client does **not** need to be running for PocketForge or Claude Code to use the gateway.
 
-- `GET {baseUrl}/models`
-- `POST {baseUrl}/chat/completions`
-- Bearer authentication
-- OpenAI-style SSE streaming
+---
 
-Set PocketForge's Custom/OpenAI-compatible provider base URL to the gateway onion base URL.
+## 🚀 PocketForge & Claude Code Integration
 
-Example:
+PocketForge uses Claude Code as an autonomous agent connecting to this gateway through the standard **Anthropic Messages API** protocol (`/v1/messages`).
 
-`https://YOUR-SERVICE-ADDRESS.onion`
+### PocketForge Custom API Configuration
 
-Do not append `/v1` unless your gateway is intentionally deployed with that prefix.
+In PocketForge's API Settings:
 
-## Tor note
+| Setting | Value |
+| :--- | :--- |
+| **Provider** | `Anthropic-compatible` / `Custom API` |
+| **Base URL** | `http://YOUR-ONION-ADDRESS.onion` (or `https://...`) |
+| **API Key** | `YOUR_GATEWAY_API_KEY` (configured in `.env`) |
+| **Model** | `claude-3-7-sonnet-20250219` (or your configured `CHAT_MODEL`) |
 
-This first release uses a strict SOCKS interface rather than bundling a Tor daemon inside the APK. The app refuses non-`.onion` hosts and never falls back to normal networking.
+> **Note on Tool Safety**: The gateway **does not** execute tools on the server. When Claude Code outputs a `tool_use` content block, the gateway relays it to PocketForge. PocketForge executes the tool within its local sandbox/policy layer and sends back `tool_result` blocks in the next turn.
 
-For a fully standalone APK, embed and lifecycle-manage an audited Tor/Arti runtime in a later release. Do not weaken the `.onion` check to make ordinary HTTPS work.
+---
 
-## Server gateway
+## 📡 API Endpoints
 
+### 1. Anthropic-Compatible Messages API
+- **`POST /v1/messages`**
+  - **Headers**: `x-api-key: <gateway-key>` or `Authorization: Bearer <gateway-key>`
+  - **Body fields**: `model`, `max_tokens`, `messages`, `system`, `temperature`, `top_p`, `top_k`, `stop_sequences`, `stream`, `tools`, `tool_choice`, `metadata`
+  - **Content blocks supported**: `text`, `image` (base64 data), `tool_use`, `tool_result`
+  - **Streaming**: Strict Anthropic SSE event stream (`message_start` → `content_block_start` → `content_block_delta` → `content_block_stop` → `message_delta` → `message_stop`).
+
+### 2. Model Discovery
+- **`GET /v1/models`** & **`GET /models`**
+  - Returns list of available models configured on the gateway (`CHAT_MODEL`, `CODE_MODEL`, `IMAGE_MODEL`).
+
+### 3. OpenAI-Compatible Chat Completions
+- **`POST /v1/chat/completions`** & **`POST /chat/completions`**
+  - Supports streaming and non-streaming requests with tool calls.
+
+### 4. Image Generation
+- **`POST /v1/images/generations`** & **`POST /images/generations`**
+  - Dispatches image prompts to the upstream image model.
+
+### 5. Health Check
+- **`GET /health`** & **`GET /`**
+  - Minimal privacy-safe status indicator.
+
+---
+
+## 🛡️ Privacy & Zero-Logging Guarantees
+
+1. **Zero Data Retention**: No prompts, model outputs, conversation histories, IP addresses, authorization tokens, or cookies are logged to disk, standard out, or remote sinks.
+2. **Header Sanitization**: Sensitive headers (`Authorization`, `x-api-key`, `Cookie`) are strictly redacted in any internal logs.
+3. **No Third-Party Analytics**: Neither the server nor the Android client includes Firebase Analytics, Sentry, advertising SDKs, or tracking scripts.
+4. **Android Keystore AES-GCM**: Local chat history and API configurations on the Android client are encrypted at rest using a hardware-backed master key.
+5. **Tor-Only Strict Enforcement**: The Android client strictly rejects non-`.onion` hostnames and communicates exclusively via local Tor SOCKS5 proxy (default `127.0.0.1:9050`). No clear-net fallback is permitted.
+
+---
+
+## ⚙️ Server Deployment Guide
+
+### Prerequisites
+- Python 3.10+
+- Tor daemon installed (e.g. `sudo apt install tor`)
+
+### 1. Configure Environment
+Create `.env` in the server root:
+```bash
+cp .env.example .env
+```
+
+Configure your parameters:
+```env
+GATEWAY_API_KEY=my-secure-gateway-secret
+UPSTREAM_PROTOCOL=openai
+UPSTREAM_BASE_URL=https://api.openai.com/v1
+UPSTREAM_API_KEY=sk-...
+CHAT_MODEL=claude-3-7-sonnet-20250219
+CODE_MODEL=claude-3-7-sonnet-20250219
+IMAGE_MODEL=dall-e-3
+```
+
+### 2. Run Gateway
 ```bash
 cd server
-python -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
 uvicorn main:app --host 127.0.0.1 --port 8443
 ```
 
-Put TLS/Tor in front of it and keep the API process bound to localhost.
+### 3. Configure Tor Onion Service
+Edit `/etc/tor/torrc`:
+```text
+HiddenServiceDir /var/lib/tor/private-ai/
+HiddenServicePort 80 127.0.0.1:8443
+HiddenServicePort 443 127.0.0.1:8443
+HiddenServiceVersion 3
+```
 
-### Privacy requirements
+Restart Tor and read your `.onion` address:
+```bash
+sudo systemctl restart tor
+sudo cat /var/lib/tor/private-ai/hostname
+```
 
-- No request/response logging.
-- No analytics.
-- No cookies or persistent user identifiers.
-- Do not store prompts, responses, IP addresses, or Authorization headers.
-- Use aggregate rate limiting only if necessary.
-- Never put upstream provider credentials in the APK.
-- Use a dedicated gateway key for PocketForge; rotate it if exposed.
+---
 
-## Build
+## 🧪 Testing & Verification
 
-Open the directory in Android Studio and run:
+Run the comprehensive test suite (21 automated tests covering all protocol translations, agent loops, error handling, and security):
 
-`./gradlew assembleDebug`
+```bash
+python3 -m unittest discover -s server/tests -t server -v
+```
 
-The repository intentionally does not contain a release signing key. For a public GitHub release, sign the final APK with your own key/CI secret.
+---
 
-## Current scope
+## 📱 Android Client Build
 
-This is the initial implementation foundation. Before calling it a production security release, independently audit the embedded Tor choice, Android transport behavior, server reverse proxy, TLS, rate limiting, and all dependency versions.
+Build the Android debug APK:
+```bash
+./gradlew assembleDebug
+```
+The APK will be generated at `app/build/outputs/apk/debug/app-debug.apk`.

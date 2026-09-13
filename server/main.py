@@ -1,115 +1,206 @@
-import os, json
-import httpx
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+import os
+import json
+from typing import Any, Dict, List, Optional
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
 
-UPSTREAM = os.environ.get("UPSTREAM_BASE_URL", "").rstrip("/")
-UPSTREAM_KEY = os.environ.get("UPSTREAM_API_KEY", "")
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "your-chat-model")
-IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "your-image-model")
-UPSTREAM_PROTOCOL = os.environ.get("UPSTREAM_PROTOCOL", "openai_chat").lower()
-app = FastAPI(title="Private AI Gateway", docs_url=None, redoc_url=None)
+from config import settings
+from auth import is_authorized
+from privacy import logger, structured_error
+from provider import ModelProvider, UpstreamError
 
-def auth_ok(authorization=None, x_api_key=None):
-    expected = os.environ.get("GATEWAY_API_KEY", "")
-    return not expected or authorization == f"Bearer {expected}" or x_api_key == expected
+app = FastAPI(
+    title="Private AI Gateway",
+    description="Privacy-preserving, Tor-first API Gateway compatible with Anthropic Messages API and OpenAI formats",
+    version="1.0.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
+)
 
-def require_auth(authorization, x_api_key):
-    if not auth_ok(authorization, x_api_key): raise HTTPException(401, "Unauthorized")
+# --- MIDDLEWARE & SECURITY CHECKS ---
 
-def upstream_headers():
-    return {"Authorization": f"Bearer {UPSTREAM_KEY}", "Content-Type": "application/json"}
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    # Content-Length check to prevent denial of service
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > settings.max_request_bytes:
+        return JSONResponse(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            content=structured_error(413, "invalid_request_error", "Request payload exceeds maximum allowed size.")
+        )
+    
+    response = await call_next(request)
+    # Add anti-fingerprinting & security headers
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    return response
 
-def anthropic_to_openai(body):
-    messages=[]
-    system=body.get("system")
-    if system:
-        if isinstance(system,list): system="\n".join(x.get("text","") for x in system if isinstance(x,dict))
-        messages.append({"role":"system","content":system})
-    for msg in body.get("messages",[]):
-        content=msg.get("content","")
-        if isinstance(content,list):
-            content="\n".join(x.get("text","") for x in content if isinstance(x,dict) and x.get("type")=="text")
-        messages.append({"role":msg.get("role","user"),"content":content})
-    out={"model":body.get("model",CHAT_MODEL),"messages":messages,"stream":True}
-    for k in ("max_tokens","temperature","top_p"):
-        if k in body: out[k]=body[k]
-    if "stop_sequences" in body: out["stop"]=body["stop_sequences"]
-    return out
+# --- EXCEPTION HANDLERS (ZERO LEAKAGE) ---
 
-def sse(name,payload):
-    return f"event: {name}\ndata: {json.dumps(payload,separators=(',',':'))}\n\n".encode()
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content=structured_error(400, "invalid_request_error", "Malformed request payload.")
+    )
 
-def anthropic_start(model):
-    return [
-      sse("message_start",{"type":"message_start","message":{"id":"msg_private_ai","type":"message","role":"assistant","model":model,"content":[],"stop_reason":None,"stop_sequence":None,"usage":{"input_tokens":0,"output_tokens":0}}}),
-      sse("content_block_start",{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})
-    ]
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    err_type = "authentication_error" if exc.status_code == 401 else "invalid_request_error"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=structured_error(exc.status_code, err_type, str(exc.detail))
+    )
+
+@app.exception_handler(UpstreamError)
+async def upstream_exception_handler(request: Request, exc: UpstreamError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=structured_error(exc.status_code, exc.error_type, exc.message)
+    )
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    # Never leak internal traceback to clients
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=structured_error(500, "api_error", "An internal server error occurred.")
+    )
+
+def authenticate(authorization: Optional[str], x_api_key: Optional[str]):
+    ok, err_msg = is_authorized(authorization, x_api_key)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=err_msg)
+
+# --- ENDPOINTS ---
+
+@app.get("/")
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "private-ai-gateway"}
 
 @app.get("/models")
 @app.get("/v1/models")
-async def models(authorization: str|None=Header(default=None), x_api_key: str|None=Header(default=None)):
-    require_auth(authorization,x_api_key)
-    data=[{"id":CHAT_MODEL,"object":"model","owned_by":"private"}]
-    if IMAGE_MODEL: data.append({"id":IMAGE_MODEL,"object":"model","owned_by":"private-image"})
-    return {"object":"list","data":data}
+async def list_models(
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None)
+):
+    authenticate(authorization, x_api_key)
+    
+    data = [
+        {"id": settings.chat_model, "object": "model", "owned_by": "private-gateway"},
+    ]
+    if settings.code_model and settings.code_model != settings.chat_model:
+        data.append({"id": settings.code_model, "object": "model", "owned_by": "private-gateway"})
+    if settings.image_model:
+        data.append({"id": settings.image_model, "object": "model", "owned_by": "private-gateway"})
 
-@app.post("/chat/completions")
-async def chat(body:dict, authorization:str|None=Header(default=None), x_api_key:str|None=Header(default=None)):
-    require_auth(authorization,x_api_key)
-    if not UPSTREAM: raise HTTPException(503,"Upstream not configured")
-    body=dict(body); body.setdefault("stream",True)
-    async def stream():
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("POST",f"{UPSTREAM}/chat/completions",json=body,headers=upstream_headers()) as r:
-                if r.status_code>=400:
-                    detail=await r.aread(); yield b"data: "+detail+b"\n\n"; return
-                async for line in r.aiter_lines():
-                    if line: yield (line+"\n\n").encode()
-    return StreamingResponse(stream(),media_type="text/event-stream")
+    return {
+        "object": "list",
+        "data": data,
+        "has_more": False
+    }
 
 @app.post("/v1/messages")
-async def anthropic_messages(body:dict, authorization:str|None=Header(default=None), x_api_key:str|None=Header(default=None)):
-    require_auth(authorization,x_api_key)
-    if not UPSTREAM: raise HTTPException(503,"Upstream not configured")
-    direct=UPSTREAM_PROTOCOL=="anthropic"
-    forward=dict(body); forward["stream"]=True
-    if not direct: forward=anthropic_to_openai(body)
-    async def stream():
-        async with httpx.AsyncClient(timeout=None) as client:
-            endpoint=f"{UPSTREAM}/v1/messages" if direct else f"{UPSTREAM}/chat/completions"
-            async with client.stream("POST",endpoint,json=forward,headers=upstream_headers()) as r:
-                if r.status_code>=400:
-                    detail=(await r.aread()).decode(errors="replace")
-                    yield sse("error",{"type":"error","error":{"type":"upstream_error","message":detail}}); return
-                if direct:
-                    async for line in r.aiter_lines():
-                        if line: yield (line+"\n\n").encode()
-                    return
-                started=False
-                async for line in r.aiter_lines():
-                    if not line.startswith("data:"): continue
-                    raw=line[5:].strip()
-                    if raw=="[DONE]":
-                        if started:
-                            yield sse("content_block_stop",{"type":"content_block_stop","index":0})
-                            yield sse("message_delta",{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":None},"usage":{"output_tokens":0}})
-                            yield sse("message_stop",{"type":"message_stop"})
-                        return
-                    try:
-                        obj=json.loads(raw); choice=(obj.get("choices") or [{}])[0]
-                        delta=(choice.get("delta") or {}).get("content") or ""
-                        if not started:
-                            for e in anthropic_start(body.get("model",CHAT_MODEL)): yield e
-                            started=True
-                        if delta: yield sse("content_block_delta",{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":delta}})
-                    except json.JSONDecodeError: continue
-    return StreamingResponse(stream(),media_type="text/event-stream")
+async def anthropic_messages(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None)
+):
+    """
+    Anthropic Messages API endpoint used by Claude Code / PocketForge.
+    Supports system, messages, tools, tool_choice, tool_use, tool_result, and streaming.
+    """
+    authenticate(authorization, x_api_key)
+    
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+
+    if "messages" not in body or not isinstance(body["messages"], list):
+        raise HTTPException(status_code=400, detail="'messages' array is required in request body.")
+
+    is_stream = bool(body.get("stream", False))
+
+    if is_stream:
+        stream_gen = ModelProvider.handle_anthropic_messages_stream(body)
+        return StreamingResponse(
+            stream_gen,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Content-Type": "text/event-stream",
+                "X-Accel-Buffering": "no"
+            }
+        )
+    else:
+        resp_data = await ModelProvider.handle_anthropic_messages_non_stream(body)
+        return JSONResponse(status_code=200, content=resp_data)
+
+@app.post("/chat/completions")
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None)
+):
+    """
+    OpenAI-compatible /chat/completions endpoint.
+    """
+    authenticate(authorization, x_api_key)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+
+    is_stream, result = await ModelProvider.handle_openai_chat_completions(body)
+
+    if is_stream:
+        return StreamingResponse(
+            result,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Content-Type": "text/event-stream",
+                "X-Accel-Buffering": "no"
+            }
+        )
+    else:
+        return JSONResponse(status_code=200, content=result)
 
 @app.post("/images/generations")
-async def images(body:dict, authorization:str|None=Header(default=None), x_api_key:str|None=Header(default=None)):
-    require_auth(authorization,x_api_key)
-    if not UPSTREAM: raise HTTPException(503,"Upstream not configured")
-    async with httpx.AsyncClient(timeout=None) as client:
-        r=await client.post(f"{UPSTREAM}/images/generations",json=body,headers=upstream_headers())
-    return JSONResponse(status_code=r.status_code,content=r.json())
+@app.post("/v1/images/generations")
+async def images_generations(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None)
+):
+    """
+    Image generation endpoint.
+    """
+    authenticate(authorization, x_api_key)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
+
+    result = await ModelProvider.handle_image_generation(body)
+    return JSONResponse(status_code=200, content=result)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8443)

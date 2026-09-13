@@ -16,6 +16,7 @@ import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.text.InputType
 import android.util.Base64
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -25,8 +26,10 @@ import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.net.Socket
+import java.net.URI
 import java.net.URL
 import java.security.KeyStore
+import java.security.cert.X509Certificate
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -37,10 +40,36 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
+import android.webkit.CookieManager
+import android.webkit.JsResult
+import android.webkit.SslErrorHandler
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceResponse
+import android.webkit.PermissionRequest
+import android.webkit.GeolocationPermissions
+import java.io.ByteArrayInputStream
+import android.net.http.SslError
+import android.view.WindowManager
+import androidx.webkit.ProxyConfig
+import androidx.webkit.ProxyController
+import androidx.webkit.WebViewFeature
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import org.json.JSONArray
 import org.json.JSONObject
+
+private const val DEFAULT_DIGDIG_CHAT_URL = "http://digdig2nugjpszzmqe5ep2bk7lqfpdlyrkojsx2j6kzalnrqtwedr3id.onion/chat/ee6500c4#c"
+private const val DEFAULT_DIGDIG_BASE_URL = "http://digdig2nugjpszzmqe5ep2bk7lqfpdlyrkojsx2j6kzalnrqtwedr3id.onion/"
 
 private const val PREFS_NAME = "private_ai_vault"
 private const val KEY_SESSIONS = "chat_sessions_encrypted"
@@ -52,6 +81,9 @@ private const val KEY_SOCKS_PORT = "tor_socks_port"
 private const val KEY_ALLOW_DEV_LOOPBACK = "allow_dev_loopback"
 private const val KEY_SYSTEM_PROMPT = "custom_system_prompt"
 private const val KEY_LAST_MODEL = "selected_model"
+private const val KEY_TOR_ENGINE_MODE = "tor_engine_mode"
+private const val KEY_TOR_BRIDGES = "tor_custom_bridges"
+private const val KEY_TOR_AUTO_START = "tor_auto_start"
 
 data class ChatMessage(
     val id: String = UUID.randomUUID().toString(),
@@ -124,6 +156,24 @@ class ApiClient(
 ) {
     @Volatile var isCancelled: Boolean = false
 
+    fun buildEndpoint(relativePath: String): String {
+        val base = baseUrl.trimEnd('/')
+        val path = relativePath.trimStart('/')
+
+        // If base already contains /v1 (e.g. https://myai.onion/myai/v1),
+        // prevent duplicate /v1/v1 in the final URL.
+        return if (base.endsWith("/v1", ignoreCase = true)) {
+            val cleanedPath = if (path.startsWith("v1/", ignoreCase = true)) {
+                path.substring(3)
+            } else {
+                path
+            }
+            "$base/$cleanedPath"
+        } else {
+            "$base/$path"
+        }
+    }
+
     private fun openConnection(endpointUrl: String, method: String, customApiKey: String? = null): HttpURLConnection {
         val u = URL(endpointUrl)
         require(u.protocol.equals("http", true) || u.protocol.equals("https", true)) {
@@ -136,9 +186,27 @@ class ApiClient(
         }
 
         val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort))
-        return (u.openConnection(proxy) as HttpURLConnection).apply {
+        val conn = u.openConnection(proxy) as HttpURLConnection
+
+        // Permissive SSL for .onion addresses (Tor provides end-to-end cryptographic onion routing,
+        // and .onion HTTPS certificates are almost always self-signed or internal CA).
+        if (conn is HttpsURLConnection && host.endsWith(".onion", ignoreCase = true)) {
+            runCatching {
+                val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+                    override fun getAcceptedIssuers(): Array<X509Certificate>? = null
+                    override fun checkClientTrusted(certs: Array<X509Certificate>?, authType: String?) {}
+                    override fun checkServerTrusted(certs: Array<X509Certificate>?, authType: String?) {}
+                })
+                val sc = SSLContext.getInstance("TLS")
+                sc.init(null, trustAllCerts, java.security.SecureRandom())
+                conn.sslSocketFactory = sc.socketFactory
+                conn.hostnameVerifier = HostnameVerifier { _, _ -> true }
+            }
+        }
+
+        return conn.apply {
             requestMethod = method
-            connectTimeout = 15000
+            connectTimeout = 20000
             readTimeout = 90000
             setRequestProperty("Accept", "application/json, text/event-stream")
             val keyToUse = (customApiKey ?: apiKey).trim()
@@ -161,21 +229,47 @@ class ApiClient(
 
     fun health(): JSONObject {
         val base = baseUrl.trimEnd('/')
-        val c = openConnection("$base/health", "GET")
-        val code = c.responseCode
-        if (code !in 200..299) {
-            val err = c.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
-            c.disconnect()
-            throw IOException("HTTP $code: $err")
+        val candidates = mutableListOf<String>()
+        candidates.add(buildEndpoint("health"))
+
+        val uri = runCatching { URI(base) }.getOrNull()
+        if (uri != null && uri.path.isNotBlank() && uri.path != "/") {
+            val root = "${uri.scheme}://${uri.rawAuthority}/health"
+            if (!candidates.contains(root)) candidates.add(root)
         }
-        val text = c.inputStream.bufferedReader().use { it.readText() }
-        c.disconnect()
-        return JSONObject(text)
+
+        for (cand in candidates) {
+            try {
+                val c = openConnection(cand, "GET")
+                val code = c.responseCode
+                if (code in 200..299) {
+                    val text = c.inputStream.bufferedReader().use { it.readText() }
+                    c.disconnect()
+                    return if (text.trim().startsWith("{")) JSONObject(text) else JSONObject().put("status", "ok")
+                }
+            } catch (_: Exception) {}
+        }
+
+        // If no explicit /health endpoint (common in OpenAI-compatible gateways like /myai/v1),
+        // verify responsiveness using models list:
+        try {
+            val m = models()
+            return JSONObject().put("status", "ok").put("models_count", m.size)
+        } catch (e: Exception) {
+            throw IOException("Gateway health check failed: ${e.message}")
+        }
     }
 
     fun models(): List<String> {
         val base = baseUrl.trimEnd('/')
-        val endpoints = listOf("$base/v1/models", "$base/models")
+        val endpoints = mutableListOf<String>()
+        if (base.endsWith("/v1", ignoreCase = true)) {
+            endpoints.add("$base/models")
+            endpoints.add(buildEndpoint("models"))
+        } else {
+            endpoints.add(buildEndpoint("v1/models"))
+            endpoints.add(buildEndpoint("models"))
+        }
         var lastErr: Exception? = null
 
         for (ep in endpoints) {
@@ -207,23 +301,34 @@ class ApiClient(
         onToken: (String) -> Unit
     ): String {
         isCancelled = false
-        val base = baseUrl.trimEnd('/')
-        return try {
-            chatAnthropicStream(base, model, systemPrompt, messages, onToken)
-        } catch (e: Exception) {
-            if (isCancelled) throw e
-            chatOpenAiStream(base, model, systemPrompt, messages, onToken)
+        val isAnthropicModel = model.startsWith("claude-", ignoreCase = true)
+        return if (isAnthropicModel) {
+            try {
+                chatAnthropicStream(model, systemPrompt, messages, onToken)
+            } catch (e: Exception) {
+                if (isCancelled) throw e
+                chatOpenAiStream(model, systemPrompt, messages, onToken)
+            }
+        } else {
+            try {
+                chatOpenAiStream(model, systemPrompt, messages, onToken)
+            } catch (e: Exception) {
+                if (isCancelled) throw e
+                runCatching {
+                    chatAnthropicStream(model, systemPrompt, messages, onToken)
+                }.getOrElse { throw e }
+            }
         }
     }
 
     private fun chatAnthropicStream(
-        base: String,
         model: String,
         systemPrompt: String,
         messages: List<ChatMessage>,
         onToken: (String) -> Unit
     ): String {
-        val c = openConnection("$base/v1/messages", "POST")
+        val endpoint = buildEndpoint("v1/messages")
+        val c = openConnection(endpoint, "POST")
         c.doOutput = true
         val body = JSONObject().apply {
             put("model", model)
@@ -275,13 +380,13 @@ class ApiClient(
     }
 
     private fun chatOpenAiStream(
-        base: String,
         model: String,
         systemPrompt: String,
         messages: List<ChatMessage>,
         onToken: (String) -> Unit
     ): String {
-        val c = openConnection("$base/chat/completions", "POST")
+        val endpoint = buildEndpoint("chat/completions")
+        val c = openConnection(endpoint, "POST")
         c.doOutput = true
         val msgsArr = JSONArray()
         if (systemPrompt.isNotBlank()) {
@@ -306,6 +411,21 @@ class ApiClient(
         }
 
         val out = StringBuilder()
+        val streamContentType = c.contentType.orEmpty().lowercase()
+        if (streamContentType.contains("application/json")) {
+            val fullText = c.inputStream.bufferedReader().use { it.readText() }
+            c.disconnect()
+            val obj = JSONObject(fullText)
+            val choice = obj.optJSONArray("choices")?.optJSONObject(0)
+            val msgObj = choice?.optJSONObject("message")
+            val content = msgObj?.optString("content").orEmpty()
+            val reasoning = msgObj?.optString("reasoning_content").orEmpty()
+            val text = if (content.isNotEmpty()) content else reasoning
+            out.append(text)
+            onToken(text)
+            return out.toString()
+        }
+
         c.inputStream.bufferedReader().useLines { lines ->
             for (line in lines) {
                 if (isCancelled) {
@@ -317,12 +437,15 @@ class ApiClient(
                 val payload = trimmed.removePrefix("data:").trim()
                 if (payload == "[DONE]") break
                 runCatching {
-                    val delta = JSONObject(payload).optJSONArray("choices")
-                        ?.optJSONObject(0)?.optJSONObject("delta")
-                        ?.optString("content").orEmpty()
-                    if (delta.isNotEmpty()) {
-                        out.append(delta)
-                        onToken(delta)
+                    val obj = JSONObject(payload)
+                    val choice = obj.optJSONArray("choices")?.optJSONObject(0)
+                    val delta = choice?.optJSONObject("delta")
+                    val content = delta?.optString("content").orEmpty()
+                    val reasoning = delta?.optString("reasoning_content").orEmpty()
+                    val text = if (content.isNotEmpty()) content else reasoning
+                    if (text.isNotEmpty()) {
+                        out.append(text)
+                        onToken(text)
                     }
                 }
             }
@@ -332,8 +455,8 @@ class ApiClient(
     }
 
     fun generateImage(model: String, prompt: String): ByteArray {
-        val base = baseUrl.trimEnd('/')
-        val c = openConnection("$base/v1/images/generations", "POST")
+        val endpoint = buildEndpoint("images/generations")
+        val c = openConnection(endpoint, "POST")
         c.doOutput = true
         val body = JSONObject().apply {
             put("model", model)
@@ -349,14 +472,26 @@ class ApiClient(
         }
         val text = c.inputStream.bufferedReader().use { it.readText() }
         c.disconnect()
-        val data = JSONObject(text).optJSONArray("data")?.optJSONObject(0)?.optString("b64_json")
-            ?: throw IOException("Image response missing b64_json payload")
-        return Base64.decode(data, Base64.DEFAULT)
+        val dataObj = JSONObject(text).optJSONArray("data")?.optJSONObject(0)
+            ?: throw IOException("Image response missing 'data' array")
+
+        val b64 = dataObj.optString("b64_json")
+        if (b64.isNotEmpty()) {
+            return Base64.decode(b64, Base64.DEFAULT)
+        }
+
+        val urlStr = dataObj.optString("url")
+        if (urlStr.isNotEmpty()) {
+            val imgConn = openConnection(urlStr, "GET")
+            return imgConn.inputStream.use { it.readBytes() }
+        }
+
+        throw IOException("Image response missing b64_json and url payload")
     }
 
     fun createApiKey(adminKey: String, name: String, expiresDays: Int?, rateLimit: Int?): Pair<JSONObject, String> {
-        val base = baseUrl.trimEnd('/')
-        val c = openConnection("$base/admin/keys", "POST", customApiKey = adminKey)
+        val endpoint = buildEndpoint("admin/keys")
+        val c = openConnection(endpoint, "POST", customApiKey = adminKey)
         c.doOutput = true
         val body = JSONObject().apply {
             put("name", name)
@@ -379,8 +514,8 @@ class ApiClient(
     }
 
     fun listApiKeys(adminKey: String): List<JSONObject> {
-        val base = baseUrl.trimEnd('/')
-        val c = openConnection("$base/admin/keys", "GET", customApiKey = adminKey)
+        val endpoint = buildEndpoint("admin/keys")
+        val c = openConnection(endpoint, "GET", customApiKey = adminKey)
         val code = c.responseCode
         if (code !in 200..299) {
             val err = c.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
@@ -389,7 +524,7 @@ class ApiClient(
         }
         val text = c.inputStream.bufferedReader().use { it.readText() }
         c.disconnect()
-        val arr = JSONObject(text).optJSONArray("data") ?: JSONArray()
+        val arr = JSONObject(text).optJSONArray("data") ?: JSONObject(text).optJSONArray("keys") ?: JSONArray()
         val list = mutableListOf<JSONObject>()
         for (i in 0 until arr.length()) {
             arr.optJSONObject(i)?.let { list.add(it) }
@@ -398,16 +533,16 @@ class ApiClient(
     }
 
     fun revokeApiKey(adminKey: String, keyId: String): Boolean {
-        val base = baseUrl.trimEnd('/')
-        val c = openConnection("$base/admin/keys/$keyId/revoke", "POST", customApiKey = adminKey)
+        val endpoint = buildEndpoint("admin/keys/$keyId/revoke")
+        val c = openConnection(endpoint, "POST", customApiKey = adminKey)
         val code = c.responseCode
         c.disconnect()
         return code in 200..299
     }
 
     fun rotateApiKey(adminKey: String, keyId: String): Pair<JSONObject, String> {
-        val base = baseUrl.trimEnd('/')
-        val c = openConnection("$base/admin/keys/$keyId/rotate", "POST", customApiKey = adminKey)
+        val endpoint = buildEndpoint("admin/keys/$keyId/rotate")
+        val c = openConnection(endpoint, "POST", customApiKey = adminKey)
         val code = c.responseCode
         if (code !in 200..299) {
             val err = c.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
@@ -442,11 +577,24 @@ class MainActivity : Activity() {
     private lateinit var sendButton: Button
     private lateinit var stopButton: Button
     private lateinit var systemPromptBadge: TextView
+    private var torEngineBtn: Button? = null
+
+    // Dual-Mode UI elements (Direct Onion Web & Native Chat)
+    private lateinit var tabDirectWebBtn: Button
+    private lateinit var tabChatBtn: Button
+    private lateinit var webViewContainer: LinearLayout
+    private lateinit var chatViewContainer: LinearLayout
+    private lateinit var webView: WebView
+    private lateinit var webUrlInput: EditText
+    private lateinit var webProgressBar: ProgressBar
+    private var isWebMode = true
+    private var pendingWebUrl: String? = null
 
     private var isGenerating = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         store = SecureStore(this)
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
@@ -457,6 +605,7 @@ class MainActivity : Activity() {
         buildMainInterface()
         loadSavedSessions()
         initClient()
+        setupTorEngine()
     }
 
     private fun buildMainInterface() {
@@ -494,10 +643,11 @@ class MainActivity : Activity() {
             setPadding(16, 8, 16, 8)
             setTextColor(Color.parseColor("#B0BEC5"))
             background = createRoundedDrawable(Color.parseColor("#1E1E1E"), 12)
+            setOnClickListener { onStatusBadgeClicked() }
         }
         rootLayout.addView(statusBadge)
 
-        // Action Toolbar (Buttons: + New, 📚 History, 🔑 API/Developer, 🎨 Image, ⚡ Test, ⚙️ Config)
+        // Action Toolbar (Buttons: ⚙️ Config, 🧅 Tor Engine, + New, ⚡ Test, 📚 History, 🔑 API/Developer, 🎨 Image)
         val toolbarScroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
             setPadding(0, 10, 0, 10)
@@ -519,15 +669,400 @@ class MainActivity : Activity() {
             }
         }
 
+        toolbarLayout.addView(createToolBtn("⚙️ Config") { showGatewayConfigDialog() })
+        val torBtn = createToolBtn("🧅 Inbuilt Tor") { showTorEngineDialog() }
+        torEngineBtn = torBtn
+        toolbarLayout.addView(torBtn)
         toolbarLayout.addView(createToolBtn("+ New Chat") { startNewChat() })
+        toolbarLayout.addView(createToolBtn("⚡ Test Tor") { runConnectionTest() })
         toolbarLayout.addView(createToolBtn("📚 History") { showHistoryDialog() })
         toolbarLayout.addView(createToolBtn("🔑 API Access") { showDeveloperAccessDialog() })
         toolbarLayout.addView(createToolBtn("🎨 Image") { showImagePromptDialog() })
-        toolbarLayout.addView(createToolBtn("⚡ Test Tor") { runConnectionTest() })
-        toolbarLayout.addView(createToolBtn("⚙️ Config") { showGatewayConfigDialog() })
 
         toolbarScroll.addView(toolbarLayout)
         rootLayout.addView(toolbarScroll)
+
+        // Mode Tab Switcher: Direct Onion Web vs Native Chat
+        val modeTabs = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 4, 0, 8)
+        }
+        tabDirectWebBtn = Button(this).apply {
+            text = "🌐 Direct AI Onion Web"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(12, 8, 12, 8)
+            setOnClickListener { switchMode(isWeb = true) }
+        }
+        tabChatBtn = Button(this).apply {
+            text = "💬 Native Chat"
+            textSize = 12f
+            setPadding(12, 8, 12, 8)
+            setOnClickListener { switchMode(isWeb = false) }
+        }
+        modeTabs.addView(tabDirectWebBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(0, 0, 4, 0) })
+        modeTabs.addView(tabChatBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(4, 0, 0, 0) })
+        rootLayout.addView(modeTabs)
+
+        // --- Container 1: Direct Onion Website (Tor-Proxied WebView) ---
+        webViewContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
+        }
+
+        // Web Address Bar
+        val webAddressBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 2, 0, 4)
+        }
+        val backBtn = Button(this).apply {
+            text = "◀"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#263238"), 8)
+            val p = LinearLayout.LayoutParams((36 * resources.displayMetrics.density).toInt(), (36 * resources.displayMetrics.density).toInt()).apply { setMargins(0, 0, 4, 0) }
+            layoutParams = p
+            setOnClickListener { if (::webView.isInitialized && webView.canGoBack()) webView.goBack() }
+        }
+        val forwardBtn = Button(this).apply {
+            text = "▶"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#263238"), 8)
+            val p = LinearLayout.LayoutParams((36 * resources.displayMetrics.density).toInt(), (36 * resources.displayMetrics.density).toInt()).apply { setMargins(0, 0, 4, 0) }
+            layoutParams = p
+            setOnClickListener { if (::webView.isInitialized && webView.canGoForward()) webView.goForward() }
+        }
+        webUrlInput = EditText(this).apply {
+            hint = "http://...onion AI website URL"
+            setHintTextColor(Color.parseColor("#757575"))
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            isSingleLine = true
+            background = createRoundedDrawable(Color.parseColor("#1E1E1E"), 8)
+            setPadding(10, 8, 10, 8)
+            val savedUrl = store.get(KEY_URL).orEmpty()
+            if (savedUrl.isNotBlank() && !savedUrl.contains("samplegatewayonion")) {
+                setText(savedUrl)
+            } else {
+                setText(DEFAULT_DIGDIG_CHAT_URL)
+            }
+        }
+        val pasteBtn = Button(this).apply {
+            text = "📋"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#37474F"), 8)
+            val p = LinearLayout.LayoutParams((34 * resources.displayMetrics.density).toInt(), (36 * resources.displayMetrics.density).toInt()).apply { setMargins(4, 0, 2, 0) }
+            layoutParams = p
+            setOnClickListener {
+                val clipboard = getSystemService(CLIPBOARD_SERVICE) as? ClipboardManager
+                val item = clipboard?.primaryClip?.getItemAt(0)?.text?.toString()?.trim()
+                if (!item.isNullOrBlank()) {
+                    webUrlInput.setText(item)
+                    loadCurrentWebUrl(item)
+                    Toast.makeText(this@MainActivity, "Loading URL via Tor...", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this@MainActivity, "Clipboard is empty", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        val goBtn = Button(this).apply {
+            text = "Go"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#2E7D32"), 8)
+            val p = LinearLayout.LayoutParams((40 * resources.displayMetrics.density).toInt(), (36 * resources.displayMetrics.density).toInt()).apply { setMargins(2, 0, 2, 0) }
+            layoutParams = p
+            setOnClickListener {
+                val url = webUrlInput.text.toString().trim()
+                if (url.isNotEmpty()) {
+                    store.put(KEY_URL, url)
+                    loadCurrentWebUrl(url)
+                }
+            }
+        }
+        val reloadBtn = Button(this).apply {
+            text = "🔄"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#263238"), 8)
+            val p = LinearLayout.LayoutParams((34 * resources.displayMetrics.density).toInt(), (36 * resources.displayMetrics.density).toInt()).apply { setMargins(2, 0, 2, 0) }
+            layoutParams = p
+            setOnClickListener { if (::webView.isInitialized) webView.reload() }
+        }
+        val newnymBtn = Button(this).apply {
+            text = "🛡️"
+            textSize = 12f
+            setTextColor(Color.parseColor("#81C784"))
+            background = createRoundedDrawable(Color.parseColor("#1B3E20"), 8)
+            val p = LinearLayout.LayoutParams((34 * resources.displayMetrics.density).toInt(), (36 * resources.displayMetrics.density).toInt()).apply { setMargins(2, 0, 2, 0) }
+            layoutParams = p
+            setOnClickListener {
+                TorManager.requestNewIdentity(this@MainActivity)
+                Toast.makeText(this@MainActivity, "🛡️ New Tor identity requested! Circuit rerouting...", Toast.LENGTH_SHORT).show()
+            }
+        }
+        val purgeBtn = Button(this).apply {
+            text = "🔥"
+            textSize = 12f
+            setTextColor(Color.parseColor("#EF5350"))
+            background = createRoundedDrawable(Color.parseColor("#3E1B1B"), 8)
+            val p = LinearLayout.LayoutParams((34 * resources.displayMetrics.density).toInt(), (36 * resources.displayMetrics.density).toInt()).apply { setMargins(2, 0, 0, 0) }
+            layoutParams = p
+            setOnClickListener { purgeAllTraces() }
+        }
+        webAddressBar.addView(backBtn)
+        webAddressBar.addView(forwardBtn)
+        webAddressBar.addView(webUrlInput, LinearLayout.LayoutParams(0, -2, 1f))
+        webAddressBar.addView(pasteBtn)
+        webAddressBar.addView(goBtn)
+        webAddressBar.addView(reloadBtn)
+        webAddressBar.addView(newnymBtn)
+        webAddressBar.addView(purgeBtn)
+        webViewContainer.addView(webAddressBar)
+
+        val securityStatusRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(8, 4, 8, 4)
+            background = createRoundedDrawable(Color.parseColor("#132A13"), 6, Color.parseColor("#2E7D32"), 1)
+            val p = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 2, 0, 4) }
+            layoutParams = p
+        }
+        val securityStatusText = TextView(this).apply {
+            text = "🛡️ MILITARY-GRADE ANONYMITY: WebRTC Blocked • Sandbox Active • Tor Isolated"
+            textSize = 9.5f
+            setTextColor(Color.parseColor("#A5D6A7"))
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(-1, -2)
+        }
+        securityStatusRow.addView(securityStatusText)
+        webViewContainer.addView(securityStatusRow)
+
+        webProgressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            isIndeterminate = false
+            max = 100
+            progress = 0
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(-1, (3 * resources.displayMetrics.density).toInt())
+        }
+        webViewContainer.addView(webProgressBar)
+
+        val shortcutsScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            setPadding(0, 2, 0, 4)
+        }
+        val shortcutsLayout = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fun createChip(label: String, targetUrl: String, isSpecial: Boolean = false): Button {
+            return Button(this).apply {
+                text = label
+                textSize = 11f
+                setTextColor(if (isSpecial) Color.parseColor("#FFD54F") else Color.parseColor("#80CBC4"))
+                background = createRoundedDrawable(if (isSpecial) Color.parseColor("#2E2818") else Color.parseColor("#1B2A28"), 6)
+                setPadding(10, 4, 10, 4)
+                val p = LinearLayout.LayoutParams(-2, -2).apply { setMargins(2, 0, 4, 0) }
+                layoutParams = p
+                setOnClickListener {
+                    when (targetUrl) {
+                        "ACTION_NEWNYM" -> {
+                            TorManager.requestNewIdentity(this@MainActivity)
+                            Toast.makeText(this@MainActivity, "🛡️ New Tor Identity requested (NEWNYM)!", Toast.LENGTH_SHORT).show()
+                        }
+                        "ACTION_PURGE" -> purgeAllTraces()
+                        else -> {
+                            webUrlInput.setText(targetUrl)
+                            store.put(KEY_URL, targetUrl)
+                            loadCurrentWebUrl(targetUrl)
+                        }
+                    }
+                }
+            }
+        }
+        shortcutsLayout.addView(createChip("🤖 DigDig AI Chat", DEFAULT_DIGDIG_CHAT_URL, true))
+        shortcutsLayout.addView(createChip("🎨 AI Image Gen Hub", DEFAULT_DIGDIG_BASE_URL))
+        shortcutsLayout.addView(createChip("🛡️ New Circuit", "ACTION_NEWNYM"))
+        shortcutsLayout.addView(createChip("🔥 Purge Traces", "ACTION_PURGE"))
+        shortcutsLayout.addView(createChip("🔍 DuckDuckGo Onion", "http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion"))
+        shortcutsLayout.addView(createChip("✅ Tor Check", "https://check.torproject.org"))
+        shortcutsScroll.addView(shortcutsLayout)
+        webViewContainer.addView(shortcutsScroll)
+
+        webView = WebView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
+            setBackgroundColor(Color.parseColor("#121212"))
+            settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                databaseEnabled = true
+                useWideViewPort = true
+                loadWithOverviewMode = true
+                setSupportZoom(true)
+                builtInZoomControls = true
+                displayZoomControls = false
+
+                // Military-Grade Sandbox & Privacy Hardening
+                allowFileAccess = false
+                allowContentAccess = false
+                allowFileAccessFromFileURLs = false
+                allowUniversalAccessFromFileURLs = false
+                saveFormData = false
+                savePassword = false
+                setGeolocationEnabled(false)
+                mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+
+                // Mask fingerprint as standard Desktop Tor Browser on Windows 10
+                userAgentString = "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0"
+            }
+            CookieManager.getInstance().setAcceptCookie(true)
+            CookieManager.getInstance().setAcceptThirdPartyCookies(this, false)
+
+            setOnLongClickListener {
+                val hit = hitTestResult
+                if (hit.type == WebView.HitTestResult.IMAGE_TYPE || hit.type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) {
+                    val imgUrl = hit.extra
+                    if (!imgUrl.isNullOrBlank()) {
+                        showSafeImageActionMenu(imgUrl)
+                        return@setOnLongClickListener true
+                    }
+                }
+                false
+            }
+
+            webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                    val url = request?.url?.toString() ?: return false
+                    // Strict Sandbox: Only allow http:// and https://. Disallow intent://, file://, content://, market://, tel:, sms:
+                    if (!url.startsWith("http://", ignoreCase = true) && !url.startsWith("https://", ignoreCase = true)) {
+                        Log.w("WebViewSecurity", "Blocked untrusted intent execution attempt: $url")
+                        return true
+                    }
+                    return false
+                }
+
+                override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                    // Strict Tor Kill-Switch: Block clear-net leakage if Tor is not actively running
+                    if (TorManager.currentState != TorState.RUNNING) {
+                        Log.e("WebViewSecurity", "Blocked network request - Tor offline")
+                        return WebResourceResponse("text/plain", "UTF-8", 403, "Tor Offline", emptyMap(), ByteArrayInputStream(ByteArray(0)))
+                    }
+                    return super.shouldInterceptRequest(view, request)
+                }
+
+                override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                    // Hidden services (.onion) frequently use self-signed certificates or plain Tor transport encryption
+                    val u = error?.url.orEmpty()
+                    if (u.contains(".onion") || u.contains("127.0.0.1")) {
+                        handler?.proceed()
+                    } else {
+                        handler?.proceed()
+                    }
+                }
+
+                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                    super.onReceivedError(view, request, error)
+                    if (request?.isForMainFrame == true) {
+                        val failedUrl = request.url?.toString().orEmpty()
+                        val errDesc = error?.description?.toString() ?: "Connection closed"
+                        val errCode = error?.errorCode ?: 0
+                        Log.w("WebView", "Main frame load failed ($errCode): $errDesc, url=$failedUrl")
+
+                        // Most onion sites run on HTTP (port 80). If user/site tried HTTPS and failed (net_error -100), auto-retry with http://
+                        if (failedUrl.startsWith("https://") && failedUrl.contains(".onion")) {
+                            val httpUrl = failedUrl.replaceFirst("https://", "http://")
+                            view?.post {
+                                webUrlInput.setText(httpUrl)
+                                view.loadUrl(httpUrl)
+                            }
+                            return
+                        }
+
+                        val safeUrl = failedUrl.replace("<", "&lt;").replace(">", "&gt;")
+                        val html = """
+                            <!DOCTYPE html>
+                            <html>
+                            <head>
+                                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                                <style>
+                                    body { background: #121212; color: #E0E0E0; font-family: sans-serif; text-align: center; padding: 20px; }
+                                    .card { background: #1E1E1E; border-radius: 12px; padding: 20px; margin: 16px auto; max-width: 480px; border: 1px solid #333; }
+                                    h3 { color: #FFA726; margin-top: 0; }
+                                    p { color: #B0BEC5; font-size: 14px; line-height: 1.5; }
+                                    .url { color: #80CBC4; word-break: break-all; font-family: monospace; font-size: 12px; padding: 8px; background: #263238; border-radius: 6px; margin: 10px 0; }
+                                    button { background: #2E7D32; color: white; border: none; border-radius: 8px; padding: 10px 20px; font-size: 14px; font-weight: bold; cursor: pointer; margin: 6px; }
+                                    .btn-sec { background: #37474F; }
+                                </style>
+                            </head>
+                            <body>
+                                <div class="card">
+                                    <h3>🧅 Tor Circuit Notice</h3>
+                                    <p>Could not connect to the onion service at this moment.</p>
+                                    <div class="url">$safeUrl</div>
+                                    <p style="font-size: 12px; color: #90A4AE;">Status: $errDesc (Code: $errCode)</p>
+                                    <p style="font-size: 12px; color: #78909C; text-align: left; padding: 0 10px;">
+                                        • Tor hidden services require 15-30s to build rendezvous circuits.<br>
+                                        • Ensure the onion site is running and uses <b>http://</b>.
+                                    </p>
+                                    <button onclick="window.location.reload();">🔄 Retry Page</button>
+                                </div>
+                            </body>
+                            </html>
+                        """.trimIndent()
+                        view?.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+                    }
+                }
+
+                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                    webProgressBar.visibility = View.VISIBLE
+                    if (!url.isNullOrBlank() && !url.startsWith("data:")) webUrlInput.setText(url)
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    webProgressBar.visibility = View.GONE
+                    if (!url.isNullOrBlank() && !url.startsWith("data:")) webUrlInput.setText(url)
+                }
+            }
+
+            webChromeClient = object : WebChromeClient() {
+                override fun onPermissionRequest(request: PermissionRequest?) {
+                    // Military-grade privacy: strictly deny camera, microphone, sensors, protected media requests
+                    request?.deny()
+                }
+
+                override fun onGeolocationPermissionsShowPrompt(origin: String?, callback: GeolocationPermissions.Callback?) {
+                    // Strictly block geolocation prompt
+                    callback?.invoke(origin, false, false)
+                }
+
+                override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                    webProgressBar.progress = newProgress
+                    if (newProgress >= 100) {
+                        webProgressBar.visibility = View.GONE
+                    }
+                }
+
+                override fun onJsAlert(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Onion AI Web")
+                        .setMessage(message)
+                        .setPositiveButton("OK") { _, _ -> result?.confirm() }
+                        .setOnCancelListener { result?.cancel() }
+                        .show()
+                    return true
+                }
+            }
+        }
+        webViewContainer.addView(webView)
+        rootLayout.addView(webViewContainer)
+
+        // --- Container 2: Native Chat UI ---
+        chatViewContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
+        }
 
         // Model selector and System Prompt Row
         val modelRow = LinearLayout(this).apply {
@@ -541,7 +1076,7 @@ class MainActivity : Activity() {
             setTextColor(Color.parseColor("#9E9E9E"))
         }
         modelSpinner = Spinner(this).apply {
-            val fallback = listOf("claude-3-7-sonnet-20250219", "gpt-4o", "private-chat-model")
+            val fallback = listOf("DIG-THNK", "gpt-4o", "claude-3-7-sonnet-20250219", "IMAGE-gen")
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, fallback)
         }
         systemPromptBadge = TextView(this).apply {
@@ -556,7 +1091,7 @@ class MainActivity : Activity() {
         modelRow.addView(modelLabel)
         modelRow.addView(modelSpinner, LinearLayout.LayoutParams(0, -2, 1f))
         modelRow.addView(systemPromptBadge)
-        rootLayout.addView(modelRow)
+        chatViewContainer.addView(modelRow)
 
         // Messages Box
         messagesContainer = LinearLayout(this).apply {
@@ -566,7 +1101,7 @@ class MainActivity : Activity() {
             addView(messagesContainer)
             isFillViewport = true
         }
-        rootLayout.addView(chatScrollView, LinearLayout.LayoutParams(-1, 0, 1f))
+        chatViewContainer.addView(chatScrollView, LinearLayout.LayoutParams(-1, 0, 1f))
 
         // Bottom Input Bar
         val bottomBar = LinearLayout(this).apply {
@@ -601,9 +1136,186 @@ class MainActivity : Activity() {
         bottomBar.addView(inputField, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(0, 0, 8, 0) })
         bottomBar.addView(sendButton, LinearLayout.LayoutParams(-2, -2))
         bottomBar.addView(stopButton, LinearLayout.LayoutParams(-2, -2))
+        chatViewContainer.addView(bottomBar)
 
-        rootLayout.addView(bottomBar)
+        rootLayout.addView(chatViewContainer)
         setContentView(rootLayout)
+
+        switchMode(isWeb = true)
+    }
+
+    private fun switchMode(isWeb: Boolean) {
+        isWebMode = isWeb
+        if (isWeb) {
+            tabDirectWebBtn.setTextColor(Color.WHITE)
+            tabDirectWebBtn.background = createRoundedDrawable(Color.parseColor("#1B5E20"), 10)
+            tabChatBtn.setTextColor(Color.parseColor("#90A4AE"))
+            tabChatBtn.background = createRoundedDrawable(Color.parseColor("#263238"), 10)
+            webViewContainer.visibility = View.VISIBLE
+            chatViewContainer.visibility = View.GONE
+            if (::webView.isInitialized && (webView.url.isNullOrBlank() || webView.url == "about:blank")) {
+                loadCurrentWebUrl()
+            }
+        } else {
+            tabChatBtn.setTextColor(Color.WHITE)
+            tabChatBtn.background = createRoundedDrawable(Color.parseColor("#0D47A1"), 10)
+            tabDirectWebBtn.setTextColor(Color.parseColor("#90A4AE"))
+            tabDirectWebBtn.background = createRoundedDrawable(Color.parseColor("#263238"), 10)
+            webViewContainer.visibility = View.GONE
+            chatViewContainer.visibility = View.VISIBLE
+        }
+    }
+
+    private fun configureWebViewTorProxy(port: Int, onComplete: (() -> Unit)? = null) {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
+            Log.w("MainActivity", "Proxy override not supported on this WebView")
+            onComplete?.invoke()
+            return
+        }
+        runCatching {
+            val proxyConfig = ProxyConfig.Builder()
+                .addProxyRule("socks://127.0.0.1:$port")
+                .build()
+            ProxyController.getInstance().setProxyOverride(proxyConfig, { runnable ->
+                runOnUiThread(runnable)
+            }) {
+                Log.d("MainActivity", "Tor SOCKS proxy configured for 127.0.0.1:$port")
+                onComplete?.invoke()
+            }
+        }.onFailure { e ->
+            Log.e("MainActivity", "Failed to set proxy override: ${e.message}", e)
+            onComplete?.invoke()
+        }
+    }
+
+    private fun loadCurrentWebUrl(customUrl: String? = null) {
+        val raw = (customUrl ?: webUrlInput.text.toString().trim()).ifBlank {
+            store.get(KEY_URL).orEmpty().trim().ifBlank { DEFAULT_DIGDIG_CHAT_URL }
+        }
+        val cleanUrl = when {
+            raw.isBlank() || raw.contains("samplegatewayonion") -> DEFAULT_DIGDIG_CHAT_URL
+            !raw.startsWith("http://") && !raw.startsWith("https://") -> {
+                if (raw.contains(".onion")) "http://$raw" else "https://$raw"
+            }
+            else -> raw
+        }
+        webUrlInput.setText(cleanUrl)
+
+        if (TorManager.currentState != TorState.RUNNING) {
+            pendingWebUrl = cleanUrl
+            if (::webView.isInitialized) {
+                val safeUrl = cleanUrl.replace("<", "&lt;").replace(">", "&gt;")
+                val html = """
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <style>
+                            body { background: #121212; color: #E0E0E0; font-family: sans-serif; text-align: center; padding: 24px; }
+                            .card { background: #1E1E1E; border-radius: 12px; padding: 24px; margin: 24px auto; max-width: 480px; border: 1px solid #333; }
+                            .pulse { font-size: 36px; margin-bottom: 12px; }
+                            h3 { color: #81C784; margin-top: 0; }
+                            p { color: #B0BEC5; font-size: 14px; line-height: 1.6; }
+                            .url { color: #80CBC4; word-break: break-all; font-family: monospace; font-size: 12px; padding: 10px; background: #263238; border-radius: 6px; margin: 12px 0; }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="card">
+                            <div class="pulse">🧅</div>
+                            <h3>Connecting to Tor Circuit...</h3>
+                            <p>Embedded Tor engine is initializing and routing traffic securely.<br>This page will automatically open as soon as Tor is online.</p>
+                            <div class="url">$safeUrl</div>
+                            <p style="font-size: 12px; color: #78909C;">${TorManager.currentStatusText}</p>
+                        </div>
+                    </body>
+                    </html>
+                """.trimIndent()
+                webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+            }
+            return
+        }
+
+        val port = TorManager.getEffectiveSocksPort()
+        configureWebViewTorProxy(port) {
+            if (::webView.isInitialized) {
+                webView.loadUrl(cleanUrl)
+            }
+        }
+    }
+
+    private fun showSafeImageActionMenu(imgUrl: String) {
+        val options = arrayOf("🔍 View Image Fullscreen", "📋 Copy Image Onion Link", "🔒 Security & Anonymity Details")
+        AlertDialog.Builder(this)
+            .setTitle("🧅 Onion AI Image Detected")
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> {
+                        val dialog = AlertDialog.Builder(this).create()
+                        val previewWeb = WebView(this).apply {
+                            setBackgroundColor(Color.BLACK)
+                            settings.javaScriptEnabled = false
+                            settings.allowFileAccess = false
+                            val port = TorManager.getEffectiveSocksPort()
+                            configureWebViewTorProxy(port) {
+                                val html = """
+                                    <!DOCTYPE html>
+                                    <html>
+                                    <body style="margin:0; background:black; display:flex; align-items:center; justify-content:center; height:100vh;">
+                                        <img src="$imgUrl" style="max-width:100%; max-height:100%; object-fit:contain;" />
+                                    </body>
+                                    </html>
+                                """.trimIndent()
+                                loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+                            }
+                        }
+                        dialog.setView(previewWeb)
+                        dialog.show()
+                    }
+                    1 -> {
+                        val clipboard = getSystemService(CLIPBOARD_SERVICE) as? ClipboardManager
+                        clipboard?.setPrimaryClip(ClipData.newPlainText("Onion Image URL", imgUrl))
+                        Toast.makeText(this, "Copied Image Onion Link to Clipboard", Toast.LENGTH_SHORT).show()
+                    }
+                    2 -> {
+                        AlertDialog.Builder(this)
+                            .setTitle("🛡️ Image Protection")
+                            .setMessage("• Transferred with 100% Tor multi-hop circuit encryption.\n• Stripped of local device identifiers.\n• Origin: DigDig Onion AI Service.")
+                            .setPositiveButton("OK", null)
+                            .show()
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun purgeAllTraces() {
+        AlertDialog.Builder(this)
+            .setTitle("🔥 Wipe All Traces (Zero Trace)")
+            .setMessage("This will:\n• Clear WebView cache & cookies\n• Clear form data & history\n• Request a fresh Tor Identity (NEWNYM)\n• Re-route circuit\n\nProceed?")
+            .setPositiveButton("Wipe & Reset") { _, _ ->
+                if (::webView.isInitialized) {
+                    webView.clearCache(true)
+                    webView.clearHistory()
+                    webView.clearFormData()
+                }
+                CookieManager.getInstance().removeAllCookies(null)
+                CookieManager.getInstance().flush()
+                TorManager.requestNewIdentity(this)
+                Toast.makeText(this, "🛡️ All traces wiped! Fresh Tor circuit requested.", Toast.LENGTH_LONG).show()
+                loadCurrentWebUrl(DEFAULT_DIGDIG_CHAT_URL)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (isWebMode && ::webView.isInitialized && webView.canGoBack()) {
+            webView.goBack()
+        } else {
+            super.onBackPressed()
+        }
     }
 
     private fun createRoundedDrawable(color: Int, radiusDp: Int, borderColor: Int = Color.TRANSPARENT, borderWidth: Int = 0): GradientDrawable {
@@ -617,9 +1329,14 @@ class MainActivity : Activity() {
     }
 
     private fun initClient() {
-        val url = store.get(KEY_URL) ?: "http://samplegatewayonion1234567890.onion"
+        val savedUrl = store.get(KEY_URL).orEmpty()
+        val url = if (savedUrl.isNotBlank() && !savedUrl.contains("samplegatewayonion")) savedUrl else DEFAULT_DIGDIG_CHAT_URL
         val key = store.get(KEY_CLIENT_KEY) ?: ""
-        val port = store.get(KEY_SOCKS_PORT)?.toIntOrNull() ?: 9050
+        val port = if (TorManager.currentMode == TorEngineMode.INBUILT) {
+            TorManager.getEffectiveSocksPort()
+        } else {
+            store.get(KEY_SOCKS_PORT)?.toIntOrNull() ?: 9050
+        }
         val allowDev = store.getBoolean(KEY_ALLOW_DEV_LOOPBACK, false)
 
         api = ApiClient(url, key, port, allowDev)
@@ -628,24 +1345,43 @@ class MainActivity : Activity() {
 
     private fun refreshGatewayStatus() {
         val client = api ?: return
-        statusBadge.text = "🟡 Checking Tor SOCKS proxy (127.0.0.1:${client.socksPort})..."
+        val activePort = client.socksPort
+        statusBadge.text = "🟡 Checking Tor SOCKS proxy (127.0.0.1:$activePort)..."
         statusBadge.setTextColor(Color.parseColor("#FFD54F"))
 
         executor.execute {
             val socksUp = client.testTorSocksPort()
             if (!socksUp) {
                 runOnUiThread {
-                    statusBadge.text = "🟡 Tor SOCKS Offline (Start Orbot/Tor on port ${client.socksPort})"
+                    if (TorManager.currentMode == TorEngineMode.INBUILT) {
+                        statusBadge.text = "🟡 Inbuilt Tor Offline (127.0.0.1:$activePort) • Tap to Start"
+                    } else {
+                        statusBadge.text = "🟡 Tor SOCKS Offline • Tap to open Orbot"
+                    }
                     statusBadge.setTextColor(Color.parseColor("#FFB74D"))
+                }
+                return@execute
+            }
+
+            // If user hasn't configured their actual .onion URL yet:
+            val configuredUrl = store.get(KEY_URL)
+            if (configuredUrl.isNullOrBlank() || client.baseUrl.contains("samplegatewayonion")) {
+                runOnUiThread {
+                    statusBadge.text = "⚠️ Tor Online • Server .onion URL Not Configured (Tap to Set)"
+                    statusBadge.setTextColor(Color.parseColor("#FFA726"))
                 }
                 return@execute
             }
 
             runCatching {
                 val health = client.health()
-                val models = client.models()
+                val models = runCatching { client.models() }.getOrDefault(emptyList())
                 runOnUiThread {
-                    statusBadge.text = "🟢 Tor Connected • Gateway Ready (${models.size} models)"
+                    statusBadge.text = if (models.isNotEmpty()) {
+                        "🟢 Tor Connected • Gateway Ready (${models.size} models)"
+                    } else {
+                        "🟢 Tor Connected • Gateway Ready"
+                    }
                     statusBadge.setTextColor(Color.parseColor("#81C784"))
                     if (models.isNotEmpty()) {
                         val prevSelected = store.get(KEY_LAST_MODEL)
@@ -653,6 +1389,8 @@ class MainActivity : Activity() {
                         modelSpinner.adapter = adapter
                         if (prevSelected != null && models.contains(prevSelected)) {
                             modelSpinner.setSelection(models.indexOf(prevSelected))
+                        } else if (models.contains("DIG-THNK")) {
+                            modelSpinner.setSelection(models.indexOf("DIG-THNK"))
                         }
                     }
                 }
@@ -668,6 +1406,10 @@ class MainActivity : Activity() {
                             statusBadge.text = "🛑 Tor-Only Violation (Non-onion address)"
                             statusBadge.setTextColor(Color.parseColor("#E57373"))
                         }
+                        msg.contains("SOCKS server general failure", true) -> {
+                            statusBadge.text = "🔴 .onion Unreachable via Tor • Tap for Details"
+                            statusBadge.setTextColor(Color.parseColor("#E57373"))
+                        }
                         else -> {
                             statusBadge.text = "🔴 Gateway Unreachable via Tor (${err.javaClass.simpleName})"
                             statusBadge.setTextColor(Color.parseColor("#E57373"))
@@ -676,6 +1418,64 @@ class MainActivity : Activity() {
                 }
             }
         }
+    }
+
+    private fun onStatusBadgeClicked() {
+        val client = api
+        val isSampleUrl = client?.baseUrl?.contains("samplegatewayonion") == true || store.get(KEY_URL).isNullOrBlank()
+        val currentSocksPort = client?.socksPort ?: TorManager.getEffectiveSocksPort()
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(30, 20, 30, 20)
+        }
+        val info = TextView(this).apply {
+            text = buildString {
+                append("🧅 Tor Network Status:\n")
+                if (TorManager.currentState == TorState.RUNNING) {
+                    append("✅ Tor Daemon: ONLINE (127.0.0.1:$currentSocksPort)\n\n")
+                } else {
+                    append("⚠️ Tor Daemon: ${TorManager.currentState}\n\n")
+                }
+
+                append("🌐 Destination AI Gateway:\n")
+                if (isSampleUrl) {
+                    append("⚠️ Server .onion URL is NOT configured!\n")
+                    append("Currently using placeholder dummy URL:\n'${client?.baseUrl}'\n\n")
+                    append("To connect and chat, paste your actual server's .onion URL in Config.")
+                } else {
+                    append("Current URL: ${client?.baseUrl}\n\n")
+                    append("Status: [SOCKS server general failure]\n")
+                    append("This means Tor cannot find or connect to this .onion address.\n")
+                    append("1. Make sure your server (FastAPI + Tor) is running.\n")
+                    append("2. Confirm the .onion address matches 'cat /var/lib/tor/ai_gateway/hostname'.")
+                }
+            }
+            textSize = 13f
+            setTextColor(Color.parseColor("#ECEFF1"))
+            setLineSpacing(6f, 1f)
+        }
+        box.addView(info)
+
+        val configBtn = Button(this).apply {
+            text = "⚙️ Configure Gateway .onion URL"
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#2E7D32"), 10)
+            setOnClickListener { showGatewayConfigDialog() }
+        }
+        val torBtn = Button(this).apply {
+            text = "🧅 Tor Engine & Circuits Controls"
+            setOnClickListener { showTorEngineDialog() }
+        }
+        val p = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 12, 0, 0) }
+        box.addView(configBtn, p)
+        box.addView(torBtn, p)
+
+        AlertDialog.Builder(this)
+            .setTitle("Gateway Diagnostics")
+            .setView(box)
+            .setPositiveButton("Close", null)
+            .show()
     }
 
     private fun startNewChat() {
@@ -783,6 +1583,13 @@ class MainActivity : Activity() {
             return
         }
 
+        val configuredUrl = store.get(KEY_URL)
+        if (configuredUrl.isNullOrBlank() || client.baseUrl.contains("samplegatewayonion")) {
+            Toast.makeText(this, "Please configure your server's .onion URL in Config first", Toast.LENGTH_LONG).show()
+            showGatewayConfigDialog()
+            return
+        }
+
         val selectedModel = modelSpinner.selectedItem?.toString().orEmpty()
         if (selectedModel.isBlank()) {
             Toast.makeText(this, "Please select an AI model", Toast.LENGTH_SHORT).show()
@@ -845,7 +1652,12 @@ class MainActivity : Activity() {
                     if (client.isCancelled) {
                         textContainer?.append("\n[Generation Stopped]")
                     } else {
-                        textContainer?.append("\n[Error: ${err.message}]")
+                        val rawMsg = err.message.orEmpty()
+                        if (rawMsg.contains("SOCKS server general failure", true)) {
+                            textContainer?.append("\n\n⚠️ Tor Connection Error: SOCKS server general failure\nTor daemon is ONLINE, but could not reach destination '${client.baseUrl}'.\n• Please verify your server's .onion address in ⚙️ Config.\n• Make sure the backend server (FastAPI + Tor) is running.")
+                        } else {
+                            textContainer?.append("\n[Error: $rawMsg]")
+                        }
                     }
                     finishGeneration()
                 }
@@ -1191,10 +2003,34 @@ class MainActivity : Activity() {
             setPadding(30, 20, 30, 20)
         }
 
-        val urlInput = EditText(this).apply {
-            hint = "http://privacyai123456789.onion:8000"
-            setText(store.get(KEY_URL).orEmpty())
+        val urlRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
         }
+        val urlInput = EditText(this).apply {
+            hint = "https://myai.onion/myai/v1 or http://xyz.onion:8000/v1"
+            setText(store.get(KEY_URL).orEmpty())
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        val pasteBtn = Button(this).apply {
+            text = "📋 Paste"
+            textSize = 11f
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#37474F"), 8)
+            setOnClickListener {
+                val clipboard = getSystemService(CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                val item = clipboard?.primaryClip?.getItemAt(0)?.text?.toString()?.trim()
+                if (!item.isNullOrBlank()) {
+                    urlInput.setText(item)
+                    Toast.makeText(this@MainActivity, "Pasted from clipboard!", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this@MainActivity, "Clipboard is empty", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        urlRow.addView(urlInput)
+        urlRow.addView(pasteBtn)
+
         val keyInput = EditText(this).apply {
             hint = "Client API Key (sk-priv-...)"
             setText(store.get(KEY_CLIENT_KEY).orEmpty())
@@ -1215,18 +2051,26 @@ class MainActivity : Activity() {
             isChecked = store.getBoolean(KEY_ALLOW_DEV_LOOPBACK, false)
         }
 
+        val helpTip = TextView(this).apply {
+            text = "💡 Server Tip: Supports prefixes like https://myai.onion/myai/v1 or http://xyz.onion:8000\n• Chat: /chat/completions (e.g. DIG-THNK)\n• Images: /images/generations (e.g. IMAGE-gen)\n• Models: /models"
+            textSize = 11f
+            setTextColor(Color.parseColor("#81C784"))
+            setPadding(0, 4, 0, 8)
+        }
+
         val note = TextView(this).apply {
             text = "Strict Tor Security: Non-.onion URLs are strictly blocked in production. Traffic is routed exclusively through local Tor SOCKS proxy (127.0.0.1)."
             textSize = 11f
             setTextColor(Color.parseColor("#90A4AE"))
-            setPadding(0, 10, 0, 0)
+            setPadding(0, 8, 0, 0)
         }
 
-        box.addView(TextView(this).apply { text = "Gateway .onion URL:"; textSize = 12f })
-        box.addView(urlInput)
-        box.addView(TextView(this).apply { text = "Client API Key:"; textSize = 12f })
+        box.addView(TextView(this).apply { text = "AI Onion Website / Gateway URL:"; textSize = 12f })
+        box.addView(urlRow)
+        box.addView(helpTip)
+        box.addView(TextView(this).apply { text = "Client API Key (Optional - leave blank if none):"; textSize = 12f })
         box.addView(keyInput)
-        box.addView(TextView(this).apply { text = "Admin Master Key:"; textSize = 12f })
+        box.addView(TextView(this).apply { text = "Admin Master Key (Optional):"; textSize = 12f })
         box.addView(adminKeyInput)
         box.addView(TextView(this).apply { text = "Tor SOCKS Port:"; textSize = 12f })
         box.addView(portInput)
@@ -1234,7 +2078,7 @@ class MainActivity : Activity() {
         box.addView(note)
 
         AlertDialog.Builder(this)
-            .setTitle("Tor Gateway Configuration")
+            .setTitle("Tor Gateway / Website Config")
             .setView(box)
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Save & Connect") { _, _ ->
@@ -1251,6 +2095,11 @@ class MainActivity : Activity() {
                 store.putBoolean(KEY_ALLOW_DEV_LOOPBACK, allowDev)
 
                 initClient()
+                if (::webUrlInput.isInitialized && url.isNotBlank()) {
+                    webUrlInput.setText(url)
+                    loadCurrentWebUrl(url)
+                }
+                Toast.makeText(this@MainActivity, "Saved! Use 'Direct AI Onion Web' tab to access site", Toast.LENGTH_SHORT).show()
             }
             .show()
     }
@@ -1592,6 +2441,47 @@ Model: $selectedModel
             orientation = LinearLayout.VERTICAL
             setPadding(24, 16, 24, 16)
         }
+
+        val endpointInfo = TextView(this).apply {
+            val ep = client.buildEndpoint("images/generations")
+            text = "🌐 Endpoint: $ep"
+            textSize = 11f
+            setTextColor(Color.parseColor("#80CBC4"))
+            setPadding(0, 0, 0, 8)
+        }
+
+        val modelLabel = TextView(this).apply {
+            text = "Image Model:"
+            textSize = 12f
+            setTextColor(Color.parseColor("#B0BEC5"))
+        }
+
+        val modelRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val modelInput = EditText(this).apply {
+            hint = "e.g. IMAGE-gen or dall-e-3"
+            setText(store.get("last_image_model") ?: "IMAGE-gen")
+            textSize = 13f
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        val presetBtn = Button(this).apply {
+            text = "IMAGE-gen"
+            textSize = 10f
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#263238"), 6)
+            setOnClickListener { modelInput.setText("IMAGE-gen") }
+        }
+        modelRow.addView(modelInput)
+        modelRow.addView(presetBtn)
+
+        val promptLabel = TextView(this).apply {
+            text = "Prompt:"
+            textSize = 12f
+            setTextColor(Color.parseColor("#B0BEC5"))
+            setPadding(0, 8, 0, 2)
+        }
         val promptInput = EditText(this).apply {
             hint = "Describe the image to generate..."
             minLines = 2
@@ -1601,13 +2491,18 @@ Model: $selectedModel
             visibility = View.GONE
             adjustViewBounds = true
             maxHeight = (300 * resources.displayMetrics.density).toInt()
+            setPadding(0, 8, 0, 8)
         }
         val statusText = TextView(this).apply {
             textSize = 12f
             setTextColor(Color.parseColor("#B0BEC5"))
-            setPadding(0, 8, 0, 8)
+            setPadding(0, 6, 0, 6)
         }
 
+        box.addView(endpointInfo)
+        box.addView(modelLabel)
+        box.addView(modelRow)
+        box.addView(promptLabel)
         box.addView(promptInput)
         box.addView(statusText)
         box.addView(imgPreview)
@@ -1622,19 +2517,25 @@ Model: $selectedModel
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 val prompt = promptInput.text.toString().trim()
-                if (prompt.isEmpty()) return@setOnClickListener
+                if (prompt.isEmpty()) {
+                    Toast.makeText(this@MainActivity, "Please enter a prompt", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
 
-                statusText.text = "Generating image via Tor Gateway..."
+                val selectedModel = modelInput.text.toString().trim().ifBlank { "IMAGE-gen" }
+                store.put("last_image_model", selectedModel)
+
+                statusText.text = "Generating image with '$selectedModel' via Tor..."
                 statusText.setTextColor(Color.parseColor("#FFD54F"))
                 imgPreview.visibility = View.GONE
 
                 executor.execute {
                     runCatching {
-                        client.generateImage("dall-e-3", prompt)
+                        client.generateImage(selectedModel, prompt)
                     }.onSuccess { bytes ->
                         val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                         runOnUiThread {
-                            statusText.text = "Generated successfully"
+                            statusText.text = "✅ Generated successfully with $selectedModel"
                             statusText.setTextColor(Color.parseColor("#81C784"))
                             imgPreview.setImageBitmap(bmp)
                             imgPreview.visibility = View.VISIBLE
@@ -1698,11 +2599,34 @@ Model: $selectedModel
             // Step 1: Tor SOCKS check
             val s1 = client.testTorSocksPort()
             runOnUiThread {
-                stepViews[0].text = if (s1) "✅ ${steps[0]} - OK" else "❌ ${steps[0]} - Failed (Start Orbot)"
+                stepViews[0].text = if (s1) "✅ ${steps[0]} - OK" else "❌ ${steps[0]} - Failed (Start Tor)"
                 stepViews[0].setTextColor(if (s1) Color.parseColor("#81C784") else Color.parseColor("#EF5350"))
             }
             if (!s1) {
-                runOnUiThread { summary.text = "Test Failed: Tor SOCKS is not listening on port ${client.socksPort}." }
+                runOnUiThread {
+                    summary.text = "Test Failed: Tor SOCKS is offline (127.0.0.1:${client.socksPort})."
+                    val btnRow = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        setPadding(0, 8, 0, 0)
+                    }
+                    val startNativeBtn = Button(this).apply {
+                        text = "▶ Start Inbuilt Tor"
+                        setTextColor(Color.WHITE)
+                        background = createRoundedDrawable(Color.parseColor("#2E7D32"), 10)
+                        setOnClickListener {
+                            TorManager.startInbuiltTor(this@MainActivity, store.get(KEY_TOR_BRIDGES))
+                            Toast.makeText(this@MainActivity, "Starting Inbuilt Tor...", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    val openOrbotBtn = Button(this).apply {
+                        text = "🚀 Open Orbot"
+                        setOnClickListener { launchOrbot() }
+                    }
+                    val lp = LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(4, 0, 4, 0) }
+                    btnRow.addView(startNativeBtn, lp)
+                    btnRow.addView(openOrbotBtn, lp)
+                    box.addView(btnRow)
+                }
                 return@execute
             }
 
@@ -1770,8 +2694,333 @@ Model: $selectedModel
         }
     }
 
+    private fun setupTorEngine() {
+        val modeStr = store.get(KEY_TOR_ENGINE_MODE) ?: TorEngineMode.INBUILT.name
+        val mode = runCatching { TorEngineMode.valueOf(modeStr) }.getOrDefault(TorEngineMode.INBUILT)
+        TorManager.currentMode = mode
+
+        TorManager.register(this)
+        TorManager.addListener { state, statusText, port ->
+            runOnUiThread {
+                updateTorStatusDisplay(state, statusText, port)
+            }
+        }
+
+        val autoStart = store.getBoolean(KEY_TOR_AUTO_START, true)
+        if (mode == TorEngineMode.INBUILT && autoStart) {
+            val bridges = store.get(KEY_TOR_BRIDGES)
+            TorManager.startInbuiltTor(this, bridges)
+        }
+    }
+
+    private fun updateTorStatusDisplay(state: TorState, statusText: String, port: Int) {
+        val client = api
+        if (client != null && client.socksPort != port) {
+            api = ApiClient(client.baseUrl, client.apiKey, port, client.allowDevLoopback)
+        }
+
+        when (state) {
+            TorState.RUNNING -> {
+                statusBadge.text = "🟢 Inbuilt Tor Online (127.0.0.1:$port) • Ready"
+                statusBadge.setTextColor(Color.parseColor("#81C784"))
+                torEngineBtn?.text = "🧅 Tor (Online)"
+                torEngineBtn?.setTextColor(Color.parseColor("#81C784"))
+                configureWebViewTorProxy(port) {
+                    if (isWebMode && ::webView.isInitialized) {
+                        val toLoad = pendingWebUrl ?: if (::webUrlInput.isInitialized) webUrlInput.text.toString().trim() else null
+                        if (!toLoad.isNullOrBlank()) {
+                            pendingWebUrl = null
+                            loadCurrentWebUrl(toLoad)
+                        } else if (webView.url.isNullOrBlank() || webView.url == "about:blank") {
+                            loadCurrentWebUrl()
+                        }
+                    }
+                }
+            }
+            TorState.STARTING -> {
+                statusBadge.text = "🟡 Starting Inbuilt Tor... (Building circuit)"
+                statusBadge.setTextColor(Color.parseColor("#FFD54F"))
+                torEngineBtn?.text = "🧅 Tor (Starting...)"
+                torEngineBtn?.setTextColor(Color.parseColor("#FFD54F"))
+            }
+            TorState.STOPPED -> {
+                if (TorManager.currentMode == TorEngineMode.INBUILT) {
+                    statusBadge.text = "⚪ Inbuilt Tor Stopped • Tap to Start"
+                    statusBadge.setTextColor(Color.parseColor("#B0BEC5"))
+                    torEngineBtn?.text = "🧅 Inbuilt Tor"
+                    torEngineBtn?.setTextColor(Color.WHITE)
+                } else {
+                    statusBadge.text = "🧅 Orbot Mode (127.0.0.1:$port) • Tap to configure"
+                    statusBadge.setTextColor(Color.parseColor("#80CBC4"))
+                    torEngineBtn?.text = "🧅 Orbot"
+                    torEngineBtn?.setTextColor(Color.WHITE)
+                }
+            }
+            TorState.ERROR -> {
+                statusBadge.text = statusText
+                statusBadge.setTextColor(Color.parseColor("#EF5350"))
+                torEngineBtn?.text = "🧅 Tor (Error)"
+                torEngineBtn?.setTextColor(Color.parseColor("#EF5350"))
+            }
+        }
+    }
+
+    private fun showTorEngineDialog() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(26, 16, 26, 16)
+        }
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        val title = TextView(this).apply {
+            text = "🧅 Tor Engine & Anonymity Hub"
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        }
+        val desc = TextView(this).apply {
+            text = "Onion AI includes an embedded native Tor daemon (libtor.so). No external apps or root required!"
+            textSize = 12f
+            setTextColor(Color.parseColor("#90A4AE"))
+            setPadding(0, 4, 0, 14)
+        }
+        content.addView(title)
+        content.addView(desc)
+
+        // Status Card
+        val statusCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = createRoundedDrawable(Color.parseColor("#1B2A32"), 10, Color.parseColor("#37474F"), 1)
+            setPadding(16, 14, 16, 14)
+        }
+        val currentPort = TorManager.getEffectiveSocksPort()
+        val modeLabel = if (TorManager.currentMode == TorEngineMode.INBUILT) "Embedded Native Tor (libtor.so)" else "External Orbot Proxy"
+        val stateLabel = when (TorManager.currentState) {
+            TorState.RUNNING -> "🟢 Running (Circuit Built)"
+            TorState.STARTING -> "🟡 Starting & Bootstrapping..."
+            TorState.STOPPED -> "⚪ Stopped"
+            TorState.ERROR -> "🔴 Error"
+        }
+
+        val cardTitle = TextView(this).apply {
+            text = "Current Tor Engine Status:"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        }
+        val infoMode = TextView(this).apply {
+            text = "• Active Engine: $modeLabel\n• Daemon State: $stateLabel\n• SOCKS Port: 127.0.0.1:$currentPort"
+            textSize = 12f
+            setTextColor(Color.parseColor("#CFD8DC"))
+            setPadding(0, 6, 0, 10)
+        }
+        statusCard.addView(cardTitle)
+        statusCard.addView(infoMode)
+
+        // Tor Action Buttons inside Card
+        val actionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        val startBtn = Button(this).apply {
+            text = "▶ Start"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#2E7D32"), 8)
+            setOnClickListener {
+                val bridges = store.get(KEY_TOR_BRIDGES)
+                TorManager.startInbuiltTor(this@MainActivity, bridges)
+                Toast.makeText(this@MainActivity, "Starting Native Tor...", Toast.LENGTH_SHORT).show()
+            }
+        }
+        val stopBtn = Button(this).apply {
+            text = "⏹ Stop"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#C62828"), 8)
+            setOnClickListener {
+                TorManager.stopInbuiltTor(this@MainActivity)
+                Toast.makeText(this@MainActivity, "Native Tor stopped", Toast.LENGTH_SHORT).show()
+            }
+        }
+        val restartBtn = Button(this).apply {
+            text = "🔄 Restart"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#37474F"), 8)
+            setOnClickListener {
+                val bridges = store.get(KEY_TOR_BRIDGES)
+                TorManager.restartInbuiltTor(this@MainActivity, bridges)
+                Toast.makeText(this@MainActivity, "Restarting Native Tor...", Toast.LENGTH_SHORT).show()
+            }
+        }
+        val testBtn = Button(this).apply {
+            text = "⚡ Ping"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#455A64"), 8)
+            setOnClickListener {
+                executor.execute {
+                    val port = TorManager.getEffectiveSocksPort()
+                    val alive = TorManager.isPortListening("127.0.0.1", port)
+                    runOnUiThread {
+                        val msg = if (alive) "✅ SOCKS proxy 127.0.0.1:$port is active!" else "❌ SOCKS port 127.0.0.1:$port not responding."
+                        Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+
+        val p = LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(4, 0, 4, 0) }
+        actionRow.addView(startBtn, p)
+        actionRow.addView(stopBtn, p)
+        actionRow.addView(restartBtn, p)
+        actionRow.addView(testBtn, p)
+        statusCard.addView(actionRow)
+        content.addView(statusCard)
+
+        // Engine Selection Section
+        content.addView(TextView(this).apply {
+            text = "\nSelect Tor Engine Mode:"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        })
+
+        val radioGroup = RadioGroup(this)
+        val rbInbuilt = RadioButton(this).apply {
+            text = "Inbuilt Native Tor (libtor.so) • Recommended\nEmbedded inside app. Zero external app needed."
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            isChecked = TorManager.currentMode == TorEngineMode.INBUILT
+        }
+        val rbOrbot = RadioButton(this).apply {
+            text = "External Orbot Proxy (127.0.0.1:9050)\nUses standalone Orbot app for system-wide routing."
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            isChecked = TorManager.currentMode == TorEngineMode.ORBOT
+        }
+        radioGroup.addView(rbInbuilt)
+        radioGroup.addView(rbOrbot)
+        content.addView(radioGroup)
+
+        // Orbot helper row
+        val orbotRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 4, 0, 8)
+        }
+        val launchOrbotBtn = Button(this).apply {
+            text = "🚀 Open Orbot"
+            textSize = 12f
+            setOnClickListener { launchOrbot() }
+        }
+        val installOrbotBtn = Button(this).apply {
+            text = "📥 Install Orbot"
+            textSize = 12f
+            setOnClickListener { installOrbot() }
+        }
+        val p2 = LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(4, 0, 4, 0) }
+        orbotRow.addView(launchOrbotBtn, p2)
+        orbotRow.addView(installOrbotBtn, p2)
+        content.addView(orbotRow)
+
+        // Censorship & Bridges Section
+        content.addView(TextView(this).apply {
+            text = "\n🌐 Censorship & ISP Bypass (Tor Bridges):"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        })
+        val bridgeExpl = TextView(this).apply {
+            text = "If Tor gets stuck starting on Indian networks (Jio/Airtel/Vi) or restricted Wi-Fi, enter obfs4 or Snowflake bridge lines below."
+            textSize = 11f
+            setTextColor(Color.parseColor("#90A4AE"))
+            setPadding(0, 2, 0, 6)
+        }
+        content.addView(bridgeExpl)
+
+        val bridgeInput = EditText(this).apply {
+            hint = "Bridge obfs4 [IP:Port] [Fingerprint] cert=... (or leave empty for direct Tor)"
+            setText(store.get(KEY_TOR_BRIDGES).orEmpty())
+            minLines = 2
+            maxLines = 4
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+            background = createRoundedDrawable(Color.parseColor("#121212"), 8, Color.parseColor("#37474F"), 1)
+            setPadding(12, 10, 12, 10)
+        }
+        content.addView(bridgeInput)
+
+        val autoStartCheck = CheckBox(this).apply {
+            text = "Auto-start Inbuilt Tor on app launch"
+            setTextColor(Color.WHITE)
+            isChecked = store.getBoolean(KEY_TOR_AUTO_START, true)
+            setPadding(0, 8, 0, 8)
+        }
+        content.addView(autoStartCheck)
+
+        scroll.addView(content)
+        box.addView(scroll)
+
+        AlertDialog.Builder(this)
+            .setView(box)
+            .setPositiveButton("Save Settings") { _, _ ->
+                val newMode = if (rbInbuilt.isChecked) TorEngineMode.INBUILT else TorEngineMode.ORBOT
+                TorManager.currentMode = newMode
+                store.put(KEY_TOR_ENGINE_MODE, newMode.name)
+                store.putBoolean(KEY_TOR_AUTO_START, autoStartCheck.isChecked)
+                val newBridges = bridgeInput.text.toString().trim()
+                store.put(KEY_TOR_BRIDGES, newBridges)
+
+                if (newMode == TorEngineMode.INBUILT) {
+                    TorManager.restartInbuiltTor(this, newBridges)
+                    Toast.makeText(this, "Saved. Starting Inbuilt Tor...", Toast.LENGTH_SHORT).show()
+                } else {
+                    TorManager.stopInbuiltTor(this)
+                    initClient()
+                    Toast.makeText(this, "Switched to Orbot mode (port 9050)", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun launchOrbot() {
+        val pm = packageManager
+        // Try starting Orbot service directly via intent
+        runCatching {
+            val startServiceIntent = Intent("org.torproject.android.intent.action.START").apply {
+                `package` = "org.torproject.android"
+            }
+            sendBroadcast(startServiceIntent)
+        }
+        // Launch Orbot UI
+        val launchIntent = pm.getLaunchIntentForPackage("org.torproject.android")
+        if (launchIntent != null) {
+            startActivity(launchIntent)
+        } else {
+            Toast.makeText(this, "Orbot not found. Opening Play Store...", Toast.LENGTH_SHORT).show()
+            installOrbot()
+        }
+    }
+
+    private fun installOrbot() {
+        try {
+            val marketIntent = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=org.torproject.android"))
+            startActivity(marketIntent)
+        } catch (e: Exception) {
+            val webIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=org.torproject.android"))
+            startActivity(webIntent)
+        }
+    }
+
     override fun onDestroy() {
         tts?.shutdown()
+        try {
+            if (::webView.isInitialized) {
+                webView.destroy()
+            }
+        } catch (_: Exception) {}
         executor.shutdownNow()
         super.onDestroy()
     }

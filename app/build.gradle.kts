@@ -48,4 +48,7 @@ android {
 
 dependencies {
     implementation("org.jetbrains.kotlin:kotlin-stdlib:2.0.21")
+    implementation("info.guardianproject:tor-android:0.4.8.11")
+    implementation("info.guardianproject:jtorctl:0.4.5.7")
+    implementation("androidx.webkit:webkit:1.12.1")
 }

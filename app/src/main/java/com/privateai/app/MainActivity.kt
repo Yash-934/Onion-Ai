@@ -1,6 +1,7 @@
 package com.privateai.app
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.os.Bundle
 import android.graphics.Typeface
 import android.view.Gravity
@@ -200,7 +201,7 @@ class MainActivity : Activity() {
         if (model.isBlank()) { status.text = "Select a model"; return }
         input.setText("")
         messages += ChatMessage("user", text); addBubble(text, "user")
-        val aiBubble = TextView(this).apply { text = "AI\n"; textSize = 16f; setPadding(16,14,16,14) }
+        val aiBubble = TextView(this).apply { this.text = "AI\n"; textSize = 16f; setPadding(16,14,16,14) }
         messagesBox.addView(aiBubble)
         executor.execute {
             runCatching {

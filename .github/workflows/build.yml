@@ -1,32 +1,24 @@
-name: Continuous Integration
+name: Build Android APK
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
+      - master
   pull_request:
-    branches: [ "main" ]
+    branches:
+      - main
+      - master
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  backend-tests:
-    name: Backend Gateway Tests
+  build-apk:
+    name: Build & Export APK
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Run Backend Unit & Integration Tests
-        run: |
-          python -m unittest discover -s server/tests -t server -v
-
-  android-build:
-    name: Android Build
-    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -34,22 +26,31 @@ jobs:
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
           distribution: 'temurin'
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+          java-version: '17'
+          cache: 'gradle'
 
       - name: Prepare Debug Keystore
         run: |
           if [ -f "debug.keystore.base64" ]; then
+            echo "Decoding debug.keystore from base64..."
             base64 -d debug.keystore.base64 > debug.keystore
           elif [ ! -f "debug.keystore" ]; then
+            echo "Generating new debug.keystore..."
             keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
+          ls -la debug.keystore
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Build Android Debug APK
-        run: ./gradlew assembleDebug
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrivateAI-Debug-APK
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30

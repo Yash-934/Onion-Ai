@@ -318,5 +318,69 @@
     "rate_limit": 60,
     "last_used_at": null,
     "request_timestamps": []
+  },
+  "key_bce8eccd46de5904": {
+    "id": "key_bce8eccd46de5904",
+    "name": "PocketForge Key",
+    "key_hash": "11c9d1e88782d3b40bf84f2dd5a7362040c0e04a28390fb3e1ba5426b7cb486b",
+    "created_at": "2026-09-13T12:02:41.151939+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T12:02:41.152964+00:00",
+    "request_timestamps": [
+      1789300961.1529596
+    ]
+  },
+  "key_832f688b56f885d6": {
+    "id": "key_832f688b56f885d6",
+    "name": "Temporary Key",
+    "key_hash": "bab8298e9c6f0259877940ec9a70552bfd68c7520452ef30e5fbf4468f5b7d76",
+    "created_at": "2026-09-13T12:02:41.153762+00:00",
+    "expires_at": null,
+    "enabled": false,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T12:02:41.154623+00:00",
+    "request_timestamps": [
+      1789300961.1546195
+    ]
+  },
+  "key_cca8d2b158cbc86e": {
+    "id": "key_cca8d2b158cbc86e",
+    "name": "Rotatable Key",
+    "key_hash": "ed51ab87837459f30883d97996a09d37bce8937fadbbad75ffc6e1db4613aae6",
+    "created_at": "2026-09-13T12:02:41.156469+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T12:02:41.158297+00:00",
+    "request_timestamps": [
+      1789300961.1582918
+    ]
+  },
+  "key_14424229de907d7d": {
+    "id": "key_14424229de907d7d",
+    "name": "Rate Limited Key",
+    "key_hash": "e26044c26731823eb5bd7e929703119dbdc7066924b8824c56bcd20cf33c0f53",
+    "created_at": "2026-09-13T12:02:41.159169+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 2,
+    "last_used_at": "2026-09-13T12:02:41.161071+00:00",
+    "request_timestamps": [
+      1789300961.1600664,
+      1789300961.1610644
+    ]
+  },
+  "key_8c4461ed1f884589": {
+    "id": "key_8c4461ed1f884589",
+    "name": "Client Only Key",
+    "key_hash": "b2c04106a3a4d73a81dfea921a0e8e0c3fa28bde8d1fd5f54e2694c717832ec8",
+    "created_at": "2026-09-13T12:02:41.162097+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": null,
+    "request_timestamps": []
   }
 }

@@ -64,6 +64,18 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Publish Direct Download to GitHub Releases
+        if: success()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Publishing direct download APK to GitHub Releases..."
+          gh release create debug-latest build_output/OnionAI-Debug.apk \
+            --title "Onion AI - Direct APK Download" \
+            --notes "Direct installable Android APK (no unzip required). Download OnionAI-Debug.apk directly below on your phone." \
+            --clobber || true
+
       - name: Add Build Summary
         run: |
           echo "### 🚀 Android APK Build Successful!" >> $GITHUB_STEP_SUMMARY

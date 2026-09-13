@@ -71,4 +71,24 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build Android Debug APK
-        run: ./gradlew assembleDebug
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Prepare Named APK
+        run: |
+          mkdir -p build_output
+          cp app/build/outputs/apk/debug/app-debug.apk build_output/OnionAI-Debug.apk
+          ls -lh build_output/
+
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnionAI-Debug-APK-CI
+          path: build_output/OnionAI-Debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Add Build Summary
+        run: |
+          echo "### 🚀 Android APK Build Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "- **Artifact:** \`OnionAI-Debug-APK-CI\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **File:** \`OnionAI-Debug.apk\`" >> $GITHUB_STEP_SUMMARY

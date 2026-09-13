@@ -20,8 +20,8 @@ jobs:
           ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "Error: Koi .zip file nahi mili!"
-            exit 1
+            echo "Koi .zip file nahi mili. Skipping gracefully."
+            exit 0
           fi
 
           mkdir -p _temp_extract

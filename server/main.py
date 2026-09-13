@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
 
 from config import settings
-from auth import is_authorized
+from auth import is_authorized, is_admin_authorized, get_keystore
 from privacy import logger, structured_error
 from provider import ModelProvider, UpstreamError
 
@@ -49,7 +49,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    err_type = "authentication_error" if exc.status_code == 401 else "invalid_request_error"
+    err_type = "authentication_error" if exc.status_code in (401, 403) else ("rate_limit_error" if exc.status_code == 429 else "invalid_request_error")
     return JSONResponse(
         status_code=exc.status_code,
         content=structured_error(exc.status_code, err_type, str(exc.detail))
@@ -73,14 +73,96 @@ async def generic_exception_handler(request: Request, exc: Exception):
 def authenticate(authorization: Optional[str], x_api_key: Optional[str]):
     ok, err_msg = is_authorized(authorization, x_api_key)
     if not ok:
+        if "Rate limit" in err_msg:
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=err_msg)
+        elif "revoked" in err_msg or "disabled" in err_msg:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=err_msg)
+        else:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=err_msg)
+
+def authenticate_admin(authorization: Optional[str], x_api_key: Optional[str]):
+    ok, err_msg = is_admin_authorized(authorization, x_api_key)
+    if not ok:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=err_msg)
+
+# --- ADMIN KEY MANAGEMENT ENDPOINTS ---
+
+@app.post("/admin/keys")
+async def create_api_key(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None)
+):
+    authenticate_admin(authorization, x_api_key)
+    try:
+        body = await request.json() if (await request.body()) else {}
+    except Exception:
+        body = {}
+    
+    name = body.get("name", "")
+    expires_days = body.get("expires_in_days")
+    rate_limit = body.get("rate_limit")
+
+    metadata, secret = get_keystore().create_key(name=name, expires_in_days=expires_days, rate_limit=rate_limit)
+    return {
+        "success": True,
+        "key": secret,
+        "key_metadata": metadata,
+        "warning": "The plaintext API key is only shown once upon creation. Store it securely."
+    }
+
+@app.get("/admin/keys")
+async def list_api_keys(
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None)
+):
+    authenticate_admin(authorization, x_api_key)
+    keys = get_keystore().list_keys()
+    return {"object": "list", "data": keys}
+
+@app.delete("/admin/keys/{key_id}")
+@app.post("/admin/keys/{key_id}/revoke")
+async def revoke_api_key(
+    key_id: str,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None)
+):
+    authenticate_admin(authorization, x_api_key)
+    revoked = get_keystore().revoke_key(key_id)
+    if not revoked:
+        raise HTTPException(status_code=404, detail=f"Key {key_id} not found.")
+    return {"success": True, "id": key_id, "status": "revoked"}
+
+@app.post("/admin/keys/{key_id}/rotate")
+async def rotate_api_key(
+    key_id: str,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None)
+):
+    authenticate_admin(authorization, x_api_key)
+    res = get_keystore().rotate_key(key_id)
+    if not res:
+        raise HTTPException(status_code=404, detail=f"Key {key_id} not found.")
+    metadata, new_secret = res
+    return {
+        "success": True,
+        "key": new_secret,
+        "key_metadata": metadata,
+        "warning": "The rotated plaintext API key is only shown once. Update PocketForge or client config."
+    }
 
 # --- ENDPOINTS ---
 
 @app.get("/")
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "private-ai-gateway"}
+    return {
+        "status": "ok",
+        "service": "private-ai-gateway",
+        "chat_model": settings.chat_model,
+        "upstream_protocol": settings.upstream_protocol,
+        "tor_policy": "strict-onion-only"
+    }
 
 @app.get("/models")
 @app.get("/v1/models")

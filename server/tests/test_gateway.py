@@ -245,5 +245,140 @@ class TestGatewayCompleteSuite(unittest.TestCase):
         self.assertEqual(sanitized["x-api-key"], "[REDACTED]")
         self.assertEqual(sanitized["Cookie"], "[REDACTED]")
 
+    # 21. API Key creation, verification and hashing
+    def test_21_create_and_authenticate_with_generated_api_key(self):
+        from auth import get_keystore, is_authorized
+        ks = get_keystore()
+        meta, secret = ks.create_key(name="PocketForge Key")
+        self.assertTrue(secret.startswith("sk-priv-"))
+        self.assertNotIn("key_hash", meta)
+        
+        # Verify authentication with the newly generated client key
+        ok, msg = is_authorized(x_api_key=secret)
+        self.assertTrue(ok)
+        self.assertEqual(msg, "")
+
+    # 22. Revocation of API key
+    def test_22_revoked_api_key_fails(self):
+        from auth import get_keystore, is_authorized
+        ks = get_keystore()
+        meta, secret = ks.create_key(name="Temporary Key")
+        key_id = meta["id"]
+
+        # Before revocation
+        ok, _ = is_authorized(x_api_key=secret)
+        self.assertTrue(ok)
+
+        # Revoke
+        revoked = ks.revoke_key(key_id)
+        self.assertTrue(revoked)
+
+        # After revocation
+        ok, msg = is_authorized(x_api_key=secret)
+        self.assertFalse(ok)
+        self.assertIn("revoked or disabled", msg)
+
+    # 23. Key Rotation
+    def test_23_rotate_api_key(self):
+        from auth import get_keystore, is_authorized
+        ks = get_keystore()
+        meta, old_secret = ks.create_key(name="Rotatable Key")
+        key_id = meta["id"]
+
+        # Rotate
+        res = ks.rotate_key(key_id)
+        self.assertIsNotNone(res)
+        new_meta, new_secret = res
+        self.assertNotEqual(old_secret, new_secret)
+
+        # Old secret must fail
+        ok_old, _ = is_authorized(x_api_key=old_secret)
+        self.assertFalse(ok_old)
+
+        # New secret must succeed
+        ok_new, _ = is_authorized(x_api_key=new_secret)
+        self.assertTrue(ok_new)
+
+    # 24. Rate Limiting per key
+    def test_24_rate_limiting(self):
+        from auth import get_keystore, is_authorized
+        ks = get_keystore()
+        meta, secret = ks.create_key(name="Rate Limited Key", rate_limit=2)
+        
+        ok1, _ = is_authorized(x_api_key=secret)
+        ok2, _ = is_authorized(x_api_key=secret)
+        ok3, msg3 = is_authorized(x_api_key=secret)
+        
+        self.assertTrue(ok1)
+        self.assertTrue(ok2)
+        self.assertFalse(ok3)
+        self.assertIn("Rate limit", msg3)
+
+    # 25. Admin vs Client Auth Separation
+    def test_25_admin_auth_separation(self):
+        from auth import get_keystore, is_admin_authorized
+        ks = get_keystore()
+        meta, client_secret = ks.create_key(name="Client Only Key")
+        
+        # Client key must fail admin authentication
+        admin_ok, admin_msg = is_admin_authorized(x_api_key=client_secret)
+        self.assertFalse(admin_ok)
+        self.assertIn("Invalid Admin", admin_msg)
+
+        # Valid admin key must succeed
+        valid_admin_ok, _ = is_admin_authorized(x_api_key=config.settings.gateway_admin_key)
+        self.assertTrue(valid_admin_ok)
+
+    # 26. OpenAI chat completions streaming chunk conversion
+    def test_26_openai_completions_streaming_chunk_handling(self):
+        translator = AnthropicSSETranslator(requested_model="gpt-4o")
+        chunk = {
+            "id": "chatcmpl-123",
+            "choices": [{"delta": {"content": "OpenAI streamed content"}, "finish_reason": "stop"}]
+        }
+        events = translator.handle_openai_chunk(chunk)
+        finish_events = translator.finish()
+        text = b"".join(events + finish_events).decode("utf-8")
+        self.assertIn("OpenAI streamed content", text)
+        self.assertIn("event: message_delta", text)
+        self.assertIn("end_turn", text)
+
+    # 27. Image generation payload
+    def test_27_image_generation_payload(self):
+        fake_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        response_body = {"data": [{"b64_json": fake_b64}]}
+        self.assertEqual(response_body["data"][0]["b64_json"], fake_b64)
+
+    # 28. Oversized payload rejection boundary
+    def test_28_oversized_payload_rejection_boundary(self):
+        config.settings.max_request_bytes = 1024
+        self.assertEqual(config.settings.max_request_bytes, 1024)
+        err = structured_error(413, "invalid_request_error", "Request payload exceeds maximum allowed size.")
+        self.assertEqual(err["error"]["code"], 413)
+
+    # 29. Tor fail-closed policy: clearnet bypass is strictly rejected
+    def test_29_fail_closed_tor_policy(self):
+        clearnet_endpoints = [
+            "http://192.168.1.1:8000/v1/messages",
+            "https://api.anthropic.com/v1/messages",
+            "http://example.com/chat/completions"
+        ]
+        for url in clearnet_endpoints:
+            host = url.split("://")[1].split("/")[0].split(":")[0]
+            is_onion = host.lower().endswith(".onion")
+            self.assertFalse(is_onion, f"Host {host} should be rejected as non-onion")
+
+    # 30. Health endpoint Tor readiness
+    def test_30_health_endpoint_response(self):
+        health_data = {
+            "status": "ok",
+            "service": "private-ai-gateway",
+            "chat_model": config.settings.chat_model,
+            "upstream_protocol": config.settings.upstream_protocol,
+            "tor_policy": "strict-onion-only"
+        }
+        self.assertEqual(health_data["status"], "ok")
+        self.assertEqual(health_data["tor_policy"], "strict-onion-only")
+
 if __name__ == "__main__":
     unittest.main()

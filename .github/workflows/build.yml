@@ -5,6 +5,9 @@ on:
     branches:
       - main
       - master
+      - "**"
+    tags:
+      - "v*"
   pull_request:
     branches:
       - main
@@ -16,7 +19,7 @@ permissions:
 
 jobs:
   build-apk:
-    name: Build & Export APK
+    name: Build & Export Android APK
     runs-on: ubuntu-latest
 
     steps:
@@ -36,10 +39,10 @@ jobs:
             echo "Decoding debug.keystore from base64..."
             base64 -d debug.keystore.base64 > debug.keystore
           elif [ ! -f "debug.keystore" ]; then
-            echo "Generating new debug.keystore..."
+            echo "Generating debug.keystore..."
             keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
-          ls -la debug.keystore
+          ls -lh debug.keystore
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
@@ -47,10 +50,30 @@ jobs:
       - name: Build Debug APK
         run: ./gradlew assembleDebug --stacktrace --no-daemon
 
+      - name: Prepare Named APK
+        run: |
+          mkdir -p build_output
+          cp app/build/outputs/apk/debug/app-debug.apk build_output/OnionAI-Debug.apk
+          ls -lh build_output/
+
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PrivateAI-Debug-APK
-          path: app/build/outputs/apk/debug/*.apk
+          name: OnionAI-Debug-APK
+          path: build_output/OnionAI-Debug.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Add Build Summary
+        run: |
+          echo "### 🚀 Android APK Build Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Aapka APK taiyar hai test karne ke liye:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Artifact Name:** \`OnionAI-Debug-APK\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **File Name:** \`OnionAI-Debug.apk\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### 📲 APK Download aur Test kaise karein:" >> $GITHUB_STEP_SUMMARY
+          echo "1. GitHub repository ke **Actions** tab par jayein." >> $GITHUB_STEP_SUMMARY
+          echo "2. Latest **Build Android APK** workflow run par click karein." >> $GITHUB_STEP_SUMMARY
+          echo "3. Page ke bottom me **Artifacts** section se **OnionAI-Debug-APK** download karein." >> $GITHUB_STEP_SUMMARY
+          echo "4. Zip file extract karke phone me install karein (Orbot Tor app on rakhein)." >> $GITHUB_STEP_SUMMARY

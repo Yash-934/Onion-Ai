@@ -8,8 +8,27 @@ on:
   workflow_dispatch:
 
 jobs:
+  hygiene-check:
+    name: Repository Hygiene & Secret Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify No Secrets or Generated Artifacts Committed
+        run: |
+          echo "Checking for committed banned artifacts and exposed keys..."
+          BANNED=$(git ls-files | grep -E '(\.pyc$|__pycache__|\.pem$|hs_ed25519_secret_key|\.venv|local\.properties)' || true)
+          if [ -n "$BANNED" ]; then
+            echo "Error: Banned files committed to repository:"
+            echo "$BANNED"
+            exit 1
+          fi
+          echo "Hygiene check passed: no banned artifacts or private keys are tracked."
+
   backend-tests:
     name: Backend Gateway Tests
+    needs: hygiene-check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

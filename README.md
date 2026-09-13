@@ -79,19 +79,55 @@ In PocketForge's API Settings:
 - **`POST /v1/images/generations`** & **`POST /images/generations`**
   - Dispatches image prompts to the upstream image model.
 
-### 5. Health Check
+### 5. API Key Management (Admin Endpoints)
+- **`POST /admin/keys`**: Generate new client API keys with optional labels, expiration, and rate limits. Plaintext secret is returned once and stored only as a salted SHA-256 hash.
+- **`GET /admin/keys`**: List active/revoked key metadata (ID, label, creation date, rate limits). Secrets are never exposed.
+- **`POST /admin/keys/{id}/revoke`**: Immediately revoke an API key.
+- **`POST /admin/keys/{id}/rotate`**: Rotate secret and return new single-use plaintext key.
+
+### 6. Health Check
 - **`GET /health`** & **`GET /`**
-  - Minimal privacy-safe status indicator.
+  - Minimal privacy-safe status indicator including model identifier and Tor-only network policy flag.
 
 ---
 
-## 🛡️ Privacy & Zero-Logging Guarantees
+## 🔑 API Key System & Admin vs. Client Separation
 
+The gateway enforces strict separation between **Admin Master Authentication** and **Client API Keys**:
+
+1. **Admin Master Key (`GATEWAY_ADMIN_KEY`)**:
+   - Used exclusively for administrative operations (creating, listing, rotating, and revoking client keys).
+   - Configured via environment variable or server configuration.
+2. **Client API Keys (`sk-priv-...`)**:
+   - Distinct, cryptographically random keys (`secrets.token_urlsafe(32)`).
+   - Only the SHA-256 digest is stored server-side.
+   - Enforce individual rate limits (sliding 60-second window) and expiration dates.
+   - Immediate revocation stops downstream agent access without cycling server master credentials.
+
+---
+
+## 🛡️ Privacy Guarantees & Threat Model
+
+### Privacy Guarantees
 1. **Zero Data Retention**: No prompts, model outputs, conversation histories, IP addresses, authorization tokens, or cookies are logged to disk, standard out, or remote sinks.
 2. **Header Sanitization**: Sensitive headers (`Authorization`, `x-api-key`, `Cookie`) are strictly redacted in any internal logs.
 3. **No Third-Party Analytics**: Neither the server nor the Android client includes Firebase Analytics, Sentry, advertising SDKs, or tracking scripts.
 4. **Android Keystore AES-GCM**: Local chat history and API configurations on the Android client are encrypted at rest using a hardware-backed master key.
 5. **Tor-Only Strict Enforcement**: The Android client strictly rejects non-`.onion` hostnames and communicates exclusively via local Tor SOCKS5 proxy (default `127.0.0.1:9050`). No clear-net fallback is permitted.
+
+### Threat Model & Operational Caveats
+* **What Tor Protects**:
+  - Hides your device's direct IP address and physical location from the gateway and upstream networks.
+  - Hides the gateway's server IP and hosting provider from clients and third parties via Tor v3 Hidden Service encryption.
+  - Renders ISP eavesdropping and local network interception impossible.
+* **What Tor Does NOT Protect (Realistic Limitations)**:
+  - **Malicious Gateway**: If the gateway host is compromised, prompts transmitted to it can be inspected before being forwarded upstream. Always host your own gateway or verify the operator.
+  - **Upstream AI Provider**: The configured upstream provider (e.g., Anthropic, OpenAI) still receives the prompt content. Use pseudonymized identities and avoid transmitting PII in agent prompts.
+  - **Local Device Compromise**: If an attacker gains root or physical control of the Android device or PocketForge host, memory dumping could reveal decrypted text.
+  - **Traffic Timing Analysis**: Sophisticated global adversaries observing both entry guard and destination exit flows can theoretically perform statistical correlation attacks.
+* **Performance Realities**:
+  - Tor routes traffic through a 3-hop circuit (or 6 hops rendezvous for Hidden Services). Expect higher latency (typically 500ms–2000ms additional initial connection latency) compared to direct clearnet connections.
+  - First-token latency in streaming mode will reflect this circuit setup time. Subsequent SSE tokens flow steadily once the circuit is established.
 
 ---
 
@@ -110,6 +146,8 @@ cp .env.example .env
 Configure your parameters:
 ```env
 GATEWAY_API_KEY=my-secure-gateway-secret
+GATEWAY_ADMIN_KEY=my-secure-admin-secret
+RATE_LIMIT_PER_MINUTE=60
 UPSTREAM_PROTOCOL=openai
 UPSTREAM_BASE_URL=https://api.openai.com/v1
 UPSTREAM_API_KEY=sk-...
@@ -144,11 +182,20 @@ sudo cat /var/lib/tor/private-ai/hostname
 
 ## 🧪 Testing & Verification
 
-Run the comprehensive test suite (21 automated tests covering all protocol translations, agent loops, error handling, and security):
+Run the comprehensive test suite (31 automated tests covering all protocol translations, API key hashing, rate limiting, agent loops, error handling, and security):
 
 ```bash
 python3 -m unittest discover -s server/tests -t server -v
 ```
+
+In-App Diagnostics:
+The Android client includes a 6-step interactive diagnostic suite:
+1. SOCKS Proxy (127.0.0.1:9050) check
+2. Onion reachability
+3. Gateway `/health` ping
+4. Authentication handshake
+5. Model discovery (`/v1/models`)
+6. End-to-end AI request (`Ping` → `Pong`)
 
 ---
 

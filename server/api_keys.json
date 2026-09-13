@@ -1,0 +1,322 @@
+{
+  "key_3f54369116ad84dd": {
+    "id": "key_3f54369116ad84dd",
+    "name": "PocketForge Key",
+    "key_hash": "3b94ced7af25f6fb7ded55a65bff4547e3ca8cde6b024890ef73229a3b4778c0",
+    "created_at": "2026-09-13T11:51:02.014375+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:51:02.015145+00:00",
+    "request_timestamps": [
+      1789300262.015139
+    ]
+  },
+  "key_fbd41a495a5159eb": {
+    "id": "key_fbd41a495a5159eb",
+    "name": "Temporary Key",
+    "key_hash": "feb1cbbf10fe489b395afa30adbac563876ba0df4b01a216beb813a1b95a8b40",
+    "created_at": "2026-09-13T11:51:02.015570+00:00",
+    "expires_at": null,
+    "enabled": false,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:51:02.016043+00:00",
+    "request_timestamps": [
+      1789300262.0160391
+    ]
+  },
+  "key_80c1cdb7265c2ec7": {
+    "id": "key_80c1cdb7265c2ec7",
+    "name": "Rotatable Key",
+    "key_hash": "9eddbade8b11ac26ee50112788369f7a395be917fc6fc661145658916a98b0b6",
+    "created_at": "2026-09-13T11:51:02.016838+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:51:02.017598+00:00",
+    "request_timestamps": [
+      1789300262.0175953
+    ]
+  },
+  "key_84b389830403eea4": {
+    "id": "key_84b389830403eea4",
+    "name": "Rate Limited Key",
+    "key_hash": "3f16482ac313a3232c71cb5c1d773b0c7a7cb2688e8ee4f4154f60c4b6a10392",
+    "created_at": "2026-09-13T11:51:02.017957+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 2,
+    "last_used_at": "2026-09-13T11:51:02.018674+00:00",
+    "request_timestamps": [
+      1789300262.0183291,
+      1789300262.018671
+    ]
+  },
+  "key_965b56d82ab799a7": {
+    "id": "key_965b56d82ab799a7",
+    "name": "Client Only Key",
+    "key_hash": "b02f842e3bebc3075e4e64bca15147716f679e263aa5991cda9e29b80392ffaa",
+    "created_at": "2026-09-13T11:51:02.019147+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": null,
+    "request_timestamps": []
+  },
+  "key_5695124135884ece": {
+    "id": "key_5695124135884ece",
+    "name": "PocketForge Key",
+    "key_hash": "bff2613d9f1f5a96f6178ef5e3e4310ddf1b801e869255611b765baa545d5cb9",
+    "created_at": "2026-09-13T11:52:48.856095+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:52:48.856680+00:00",
+    "request_timestamps": [
+      1789300368.8566766
+    ]
+  },
+  "key_2092dc98f8ee79cd": {
+    "id": "key_2092dc98f8ee79cd",
+    "name": "Temporary Key",
+    "key_hash": "2bed4ffcd05290fa3158bce8d7912d9b7308714ef870987d3176283dce04c305",
+    "created_at": "2026-09-13T11:52:48.857305+00:00",
+    "expires_at": null,
+    "enabled": false,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:52:48.857772+00:00",
+    "request_timestamps": [
+      1789300368.8577688
+    ]
+  },
+  "key_a7e4fbc2851b4d0b": {
+    "id": "key_a7e4fbc2851b4d0b",
+    "name": "Rotatable Key",
+    "key_hash": "043ca0bdd775881502ed762a66728f8816bc628fac6af2b2b60a9d56267be759",
+    "created_at": "2026-09-13T11:52:48.858653+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:52:48.859601+00:00",
+    "request_timestamps": [
+      1789300368.8595989
+    ]
+  },
+  "key_7ba28f3fb368367e": {
+    "id": "key_7ba28f3fb368367e",
+    "name": "Rate Limited Key",
+    "key_hash": "a219cd2c2373fe563a99ea7889e1e919d1ba3e8b0ae79eeccf43b846da256dc9",
+    "created_at": "2026-09-13T11:52:48.860009+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 2,
+    "last_used_at": "2026-09-13T11:52:48.860854+00:00",
+    "request_timestamps": [
+      1789300368.860422,
+      1789300368.8608503
+    ]
+  },
+  "key_60eb1bbc834271ba": {
+    "id": "key_60eb1bbc834271ba",
+    "name": "Client Only Key",
+    "key_hash": "1b1b0cd96bf00316134d6a8b0bba89c1d92e01a72ad37f153072b17cace9ef0b",
+    "created_at": "2026-09-13T11:52:48.861418+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": null,
+    "request_timestamps": []
+  },
+  "key_8bd5b68b881406ae": {
+    "id": "key_8bd5b68b881406ae",
+    "name": "PocketForge Key",
+    "key_hash": "d3619e698bb4a1dd2df930298c81aedd3877d09bb15573aaa541532e4637b191",
+    "created_at": "2026-09-13T11:53:02.763391+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:53:02.764073+00:00",
+    "request_timestamps": [
+      1789300382.7640693
+    ]
+  },
+  "key_9619d5522c94a51a": {
+    "id": "key_9619d5522c94a51a",
+    "name": "Temporary Key",
+    "key_hash": "c4970c1d390277d649c5a3a64b56073bca929b132247f26bd69b5346f3686d39",
+    "created_at": "2026-09-13T11:53:02.764587+00:00",
+    "expires_at": null,
+    "enabled": false,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:53:02.765138+00:00",
+    "request_timestamps": [
+      1789300382.7651353
+    ]
+  },
+  "key_e872ce66d85d57c8": {
+    "id": "key_e872ce66d85d57c8",
+    "name": "Rotatable Key",
+    "key_hash": "5ce2dd9a70a60ba3f71b11fd18a1fb073ae88fc651203d3b1662e8e8defed36e",
+    "created_at": "2026-09-13T11:53:02.766246+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:53:02.767397+00:00",
+    "request_timestamps": [
+      1789300382.767394
+    ]
+  },
+  "key_4a7f4251e4705948": {
+    "id": "key_4a7f4251e4705948",
+    "name": "Rate Limited Key",
+    "key_hash": "52e34ab022fb531b2e6e2c357e3d9a03691bb8a8c160f5cd10ff07ee1b952616",
+    "created_at": "2026-09-13T11:53:02.767902+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 2,
+    "last_used_at": "2026-09-13T11:53:02.768921+00:00",
+    "request_timestamps": [
+      1789300382.768414,
+      1789300382.7689176
+    ]
+  },
+  "key_66083c5b5e362f7b": {
+    "id": "key_66083c5b5e362f7b",
+    "name": "Client Only Key",
+    "key_hash": "1a42bd74feab090a170efe88beba03694d041e4655be5ae4d89e996d585d42ef",
+    "created_at": "2026-09-13T11:53:02.769567+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": null,
+    "request_timestamps": []
+  },
+  "key_f5bffad8a76c1ea7": {
+    "id": "key_f5bffad8a76c1ea7",
+    "name": "PocketForge Key",
+    "key_hash": "0fcc42a206feb8becf8c041e6828f915315dcfffcc71f14feaa1ea50ee57cede",
+    "created_at": "2026-09-13T11:53:41.112915+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:53:41.113671+00:00",
+    "request_timestamps": [
+      1789300421.1136675
+    ]
+  },
+  "key_dd0b984fb193caaf": {
+    "id": "key_dd0b984fb193caaf",
+    "name": "Temporary Key",
+    "key_hash": "2fe927c56cc5e332d68a87678727be31c3ee77934bf3a156ab620764a216933a",
+    "created_at": "2026-09-13T11:53:41.114242+00:00",
+    "expires_at": null,
+    "enabled": false,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:53:41.114857+00:00",
+    "request_timestamps": [
+      1789300421.1148543
+    ]
+  },
+  "key_f08d684897beae2c": {
+    "id": "key_f08d684897beae2c",
+    "name": "Rotatable Key",
+    "key_hash": "d8cdc426d005bee8ac1b50916f7e1c24fdb4ea05a2bc235de5838986af343f36",
+    "created_at": "2026-09-13T11:53:41.116170+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:53:41.117592+00:00",
+    "request_timestamps": [
+      1789300421.1175888
+    ]
+  },
+  "key_07dbbf6be4d9b959": {
+    "id": "key_07dbbf6be4d9b959",
+    "name": "Rate Limited Key",
+    "key_hash": "9543f02ed2f3b92906b042e0d71f6e5c81a240d4dce5cb72b3e06eaf11caa47b",
+    "created_at": "2026-09-13T11:53:41.118171+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 2,
+    "last_used_at": "2026-09-13T11:53:41.119390+00:00",
+    "request_timestamps": [
+      1789300421.1187732,
+      1789300421.119386
+    ]
+  },
+  "key_06009c6d3bde42ad": {
+    "id": "key_06009c6d3bde42ad",
+    "name": "Client Only Key",
+    "key_hash": "f2cb7172b1b7c12d4c63d86616ffdcd2bc63fe7ce7f83d1a4aa876a44a22fcb0",
+    "created_at": "2026-09-13T11:53:41.120143+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": null,
+    "request_timestamps": []
+  },
+  "key_95f3702bfe6b9bc0": {
+    "id": "key_95f3702bfe6b9bc0",
+    "name": "PocketForge Key",
+    "key_hash": "afcef7e8daa29155f5fc4d639d50c543b3853676a04bd4fbb48e08623019a459",
+    "created_at": "2026-09-13T11:57:40.806939+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:57:40.808110+00:00",
+    "request_timestamps": [
+      1789300660.8081055
+    ]
+  },
+  "key_eb2da94956890dcc": {
+    "id": "key_eb2da94956890dcc",
+    "name": "Temporary Key",
+    "key_hash": "7140627d8a4c4e742d34e6ae9e1ade64b12c723dc51c6482312f8a9ddba29df3",
+    "created_at": "2026-09-13T11:57:40.808890+00:00",
+    "expires_at": null,
+    "enabled": false,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:57:40.809679+00:00",
+    "request_timestamps": [
+      1789300660.809676
+    ]
+  },
+  "key_74b865e173816624": {
+    "id": "key_74b865e173816624",
+    "name": "Rotatable Key",
+    "key_hash": "c66b03bb55698b04b78eb4cce2bb540272c55193b7a1596224e3a428913ba86b",
+    "created_at": "2026-09-13T11:57:40.811208+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": "2026-09-13T11:57:40.812847+00:00",
+    "request_timestamps": [
+      1789300660.812843
+    ]
+  },
+  "key_e6236a49df64ebbb": {
+    "id": "key_e6236a49df64ebbb",
+    "name": "Rate Limited Key",
+    "key_hash": "6d9f06e9605db30f22b1457fdbe5a8d43366c80e4c31ee341a7c5cc87880ff59",
+    "created_at": "2026-09-13T11:57:40.813540+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 2,
+    "last_used_at": "2026-09-13T11:57:40.815078+00:00",
+    "request_timestamps": [
+      1789300660.814279,
+      1789300660.815074
+    ]
+  },
+  "key_f8fe5c4156648b46": {
+    "id": "key_f8fe5c4156648b46",
+    "name": "Client Only Key",
+    "key_hash": "4df6da5977fa0c11f02cba3370ba8ad1482899cbdfd901fe74a60367eda28915",
+    "created_at": "2026-09-13T11:57:40.815953+00:00",
+    "expires_at": null,
+    "enabled": true,
+    "rate_limit": 60,
+    "last_used_at": null,
+    "request_timestamps": []
+  }
+}

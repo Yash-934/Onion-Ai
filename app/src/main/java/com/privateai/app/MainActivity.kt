@@ -2,89 +2,175 @@ package com.privateai.app
 
 import android.app.Activity
 import android.app.AlertDialog
-import android.os.Bundle
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.net.Uri
+import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import android.text.InputType
+import android.util.Base64
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.widget.*
-import android.content.*
-import android.net.Uri
-import android.provider.Settings
-import java.io.*
-import java.net.*
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.Socket
+import java.net.URL
+import java.security.KeyStore
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import android.util.Base64
-import android.speech.tts.TextToSpeech
-import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject
 
-private const val PREFS = "private_ai"
-private const val KEY_BLOB = "history_blob"
-private const val KEY_CONFIG = "config_blob"
+private const val PREFS_NAME = "private_ai_vault"
+private const val KEY_SESSIONS = "chat_sessions_encrypted"
+private const val KEY_ACTIVE_SESSION_ID = "active_session_id"
+private const val KEY_URL = "gateway_onion_url"
+private const val KEY_CLIENT_KEY = "gateway_client_key"
+private const val KEY_ADMIN_KEY = "gateway_admin_key"
+private const val KEY_SOCKS_PORT = "tor_socks_port"
+private const val KEY_ALLOW_DEV_LOOPBACK = "allow_dev_loopback"
+private const val KEY_SYSTEM_PROMPT = "custom_system_prompt"
+private const val KEY_LAST_MODEL = "selected_model"
 
-data class ChatMessage(val role: String, val content: String)
+data class ChatMessage(
+    val id: String = UUID.randomUUID().toString(),
+    val role: String,
+    val content: String,
+    val timestamp: Long = System.currentTimeMillis()
+)
 
-class SecureStore(private val ctx: Context) {
-    private val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-    private val alias = "PrivateAI_AES"
+data class ChatSession(
+    val id: String = UUID.randomUUID().toString(),
+    var title: String = "New Chat",
+    val createdAt: Long = System.currentTimeMillis(),
+    val messages: MutableList<ChatMessage> = mutableListOf()
+)
 
-    private fun key(): SecretKey {
-        val ks = java.security.KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+class SecureStore(ctx: Context) {
+    private val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val alias = "PrivateAI_MasterKey_v2"
+
+    private fun getSecretKey(): SecretKey {
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (ks.getKey(alias, null) as? SecretKey)?.let { return it }
         val kg = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
-        kg.init(KeyGenParameterSpec.Builder(
-            alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
-        ).setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-         .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-         .setUserAuthenticationRequired(false)
-         .build())
+        kg.init(
+            KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setUserAuthenticationRequired(false)
+                .build()
+        )
         return kg.generateKey()
     }
 
-    fun put(name: String, value: String) {
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, key())
-        val blob = Base64.encodeToString(cipher.iv + cipher.doFinal(value.toByteArray()), Base64.NO_WRAP)
-        prefs.edit().putString(name, blob).apply()
+    fun put(key: String, value: String) {
+        runCatching {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, getSecretKey())
+            val iv = cipher.iv
+            val ciphertext = cipher.doFinal(value.toByteArray(Charsets.UTF_8))
+            val combined = ByteArray(iv.size + ciphertext.size)
+            System.arraycopy(iv, 0, combined, 0, iv.size)
+            System.arraycopy(ciphertext, 0, combined, iv.size, ciphertext.size)
+            val blob = Base64.encodeToString(combined, Base64.NO_WRAP)
+            prefs.edit().putString(key, blob).apply()
+        }
     }
 
-    fun get(name: String): String? = runCatching {
-        val str = prefs.getString(name, null) ?: return null
-        val raw = Base64.decode(str, Base64.NO_WRAP)
-        val iv = raw.copyOfRange(0, 12)
-        val data = raw.copyOfRange(12, raw.size)
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, key(), javax.crypto.spec.GCMParameterSpec(128, iv))
-        String(cipher.doFinal(data))
-    }.getOrNull()
+    fun get(key: String): String? {
+        return runCatching {
+            val blob = prefs.getString(key, null) ?: return null
+            val raw = Base64.decode(blob, Base64.NO_WRAP)
+            if (raw.size < 12) return null
+            val iv = raw.copyOfRange(0, 12)
+            val data = raw.copyOfRange(12, raw.size)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, getSecretKey(), GCMParameterSpec(128, iv))
+            String(cipher.doFinal(data), Charsets.UTF_8)
+        }.getOrNull()
+    }
+
+    fun putBoolean(key: String, value: Boolean) = put(key, value.toString())
+    fun getBoolean(key: String, default: Boolean = false): Boolean = get(key)?.toBooleanStrictOrNull() ?: default
 }
 
-class ApiClient(private val baseUrl: String, private val apiKey: String, private val socksPort: Int) {
-    private fun open(url: String, method: String): HttpURLConnection {
-        val u = URL(url)
-        require(u.protocol.equals("http", true) || u.protocol.equals("https", true)) { "Unsupported URL scheme: ${u.protocol}" }
-        val host = u.host ?: ""
-        require(host.endsWith(".onion", ignoreCase = true)) {
-            "Tor-only security violation: '$host' is not a .onion hidden service. Clear-net connections are strictly rejected."
+class ApiClient(
+    val baseUrl: String,
+    val apiKey: String,
+    val socksPort: Int,
+    val allowDevLoopback: Boolean = false
+) {
+    @Volatile var isCancelled: Boolean = false
+
+    private fun openConnection(endpointUrl: String, method: String, customApiKey: String? = null): HttpURLConnection {
+        val u = URL(endpointUrl)
+        require(u.protocol.equals("http", true) || u.protocol.equals("https", true)) {
+            "Unsupported protocol: ${u.protocol}"
         }
+        val host = u.host ?: ""
+        val isDev = allowDevLoopback && (host == "127.0.0.1" || host == "10.0.2.2" || host == "localhost")
+        require(host.endsWith(".onion", ignoreCase = true) || isDev) {
+            "Tor-Only Policy Violation: Host '$host' does not end with '.onion'. Direct clearnet traffic is strictly forbidden to preserve IP anonymity."
+        }
+
         val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort))
         return (u.openConnection(proxy) as HttpURLConnection).apply {
             requestMethod = method
             connectTimeout = 15000
-            readTimeout = 60000
+            readTimeout = 90000
             setRequestProperty("Accept", "application/json, text/event-stream")
-            if (apiKey.isNotBlank()) {
-                setRequestProperty("Authorization", "Bearer $apiKey")
-                setRequestProperty("x-api-key", apiKey)
+            val keyToUse = (customApiKey ?: apiKey).trim()
+            if (keyToUse.isNotBlank()) {
+                setRequestProperty("Authorization", "Bearer $keyToUse")
+                setRequestProperty("x-api-key", keyToUse)
             }
             setRequestProperty("Content-Type", "application/json")
         }
+    }
+
+    fun testTorSocksPort(): Boolean {
+        return runCatching {
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress("127.0.0.1", socksPort), 4000)
+                true
+            }
+        }.getOrDefault(false)
+    }
+
+    fun health(): JSONObject {
+        val base = baseUrl.trimEnd('/')
+        val c = openConnection("$base/health", "GET")
+        val code = c.responseCode
+        if (code !in 200..299) {
+            val err = c.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            c.disconnect()
+            throw IOException("HTTP $code: $err")
+        }
+        val text = c.inputStream.bufferedReader().use { it.readText() }
+        c.disconnect()
+        return JSONObject(text)
     }
 
     fun models(): List<String> {
@@ -92,58 +178,84 @@ class ApiClient(private val baseUrl: String, private val apiKey: String, private
         val endpoints = listOf("$base/v1/models", "$base/models")
         var lastErr: Exception? = null
 
-        for (endpoint in endpoints) {
+        for (ep in endpoints) {
             try {
-                val c = open(endpoint, "GET")
-                val body = c.inputStream.bufferedReader().use { it.readText() }
-                c.disconnect()
-                val arr = JSONObject(body).optJSONArray("data") ?: JSONArray()
-                val list = (0 until arr.length()).mapNotNull {
-                    arr.optJSONObject(it)?.optString("id")?.takeIf(String::isNotBlank)
+                val c = openConnection(ep, "GET")
+                val code = c.responseCode
+                if (code in 200..299) {
+                    val text = c.inputStream.bufferedReader().use { it.readText() }
+                    c.disconnect()
+                    val arr = JSONObject(text).optJSONArray("data") ?: JSONArray()
+                    val list = mutableListOf<String>()
+                    for (i in 0 until arr.length()) {
+                        val mId = arr.optJSONObject(i)?.optString("id")
+                        if (!mId.isNullOrBlank()) list.add(mId)
+                    }
+                    if (list.isNotEmpty()) return list
                 }
-                if (list.isNotEmpty()) return list
             } catch (e: Exception) {
                 lastErr = e
             }
         }
-        throw (lastErr ?: IOException("No models found"))
+        throw (lastErr ?: IOException("No models discovered from gateway"))
     }
 
-    fun chat(model: String, messages: List<ChatMessage>, onToken: (String) -> Unit): String {
+    fun chatStream(
+        model: String,
+        systemPrompt: String,
+        messages: List<ChatMessage>,
+        onToken: (String) -> Unit
+    ): String {
+        isCancelled = false
         val base = baseUrl.trimEnd('/')
-        // Try Anthropic /v1/messages first, fall back to /chat/completions
         return try {
-            chatAnthropicMessages(base, model, messages, onToken)
+            chatAnthropicStream(base, model, systemPrompt, messages, onToken)
         } catch (e: Exception) {
-            chatOpenAiCompletions(base, model, messages, onToken)
+            if (isCancelled) throw e
+            chatOpenAiStream(base, model, systemPrompt, messages, onToken)
         }
     }
 
-    private fun chatAnthropicMessages(base: String, model: String, messages: List<ChatMessage>, onToken: (String) -> Unit): String {
-        val c = open("$base/v1/messages", "POST")
+    private fun chatAnthropicStream(
+        base: String,
+        model: String,
+        systemPrompt: String,
+        messages: List<ChatMessage>,
+        onToken: (String) -> Unit
+    ): String {
+        val c = openConnection("$base/v1/messages", "POST")
         c.doOutput = true
-        val body = JSONObject()
-            .put("model", model)
-            .put("stream", true)
-            .put("max_tokens", 4096)
-            .put("messages", JSONArray().apply {
-                messages.forEach { put(JSONObject().put("role", it.role).put("content", it.content)) }
-            }).toString()
+        val body = JSONObject().apply {
+            put("model", model)
+            put("stream", true)
+            put("max_tokens", 4096)
+            if (systemPrompt.isNotBlank()) put("system", systemPrompt)
+            val msgsArr = JSONArray()
+            messages.forEach { msg ->
+                msgsArr.put(JSONObject().put("role", msg.role).put("content", msg.content))
+            }
+            put("messages", msgsArr)
+        }.toString()
 
-        c.outputStream.use { it.write(body.toByteArray()) }
-        if (c.responseCode !in 200..299) {
+        c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        val code = c.responseCode
+        if (code !in 200..299) {
             val err = c.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
             c.disconnect()
-            error("HTTP ${c.responseCode}: $err")
+            throw IOException("Gateway HTTP $code: $err")
         }
 
         val out = StringBuilder()
         c.inputStream.bufferedReader().useLines { lines ->
-            lines.forEach { line ->
+            for (line in lines) {
+                if (isCancelled) {
+                    c.disconnect()
+                    break
+                }
                 val trimmed = line.trim()
-                if (!trimmed.startsWith("data:")) return@forEach
+                if (!trimmed.startsWith("data:")) continue
                 val payload = trimmed.removePrefix("data:").trim()
-                if (payload == "[DONE]") return@forEach
+                if (payload == "[DONE]") break
                 runCatching {
                     val obj = JSONObject(payload)
                     val type = obj.optString("type")
@@ -162,30 +274,48 @@ class ApiClient(private val baseUrl: String, private val apiKey: String, private
         return out.toString()
     }
 
-    private fun chatOpenAiCompletions(base: String, model: String, messages: List<ChatMessage>, onToken: (String) -> Unit): String {
-        val c = open("$base/chat/completions", "POST")
+    private fun chatOpenAiStream(
+        base: String,
+        model: String,
+        systemPrompt: String,
+        messages: List<ChatMessage>,
+        onToken: (String) -> Unit
+    ): String {
+        val c = openConnection("$base/chat/completions", "POST")
         c.doOutput = true
-        val body = JSONObject()
-            .put("model", model)
-            .put("stream", true)
-            .put("messages", JSONArray().apply {
-                messages.forEach { put(JSONObject().put("role", it.role).put("content", it.content)) }
-            }).toString()
+        val msgsArr = JSONArray()
+        if (systemPrompt.isNotBlank()) {
+            msgsArr.put(JSONObject().put("role", "system").put("content", systemPrompt))
+        }
+        messages.forEach { msg ->
+            msgsArr.put(JSONObject().put("role", msg.role).put("content", msg.content))
+        }
 
-        c.outputStream.use { it.write(body.toByteArray()) }
-        if (c.responseCode !in 200..299) {
+        val body = JSONObject().apply {
+            put("model", model)
+            put("stream", true)
+            put("messages", msgsArr)
+        }.toString()
+
+        c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        val code = c.responseCode
+        if (code !in 200..299) {
             val err = c.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
             c.disconnect()
-            error("HTTP ${c.responseCode}: $err")
+            throw IOException("Gateway HTTP $code: $err")
         }
 
         val out = StringBuilder()
         c.inputStream.bufferedReader().useLines { lines ->
-            lines.forEach { line ->
+            for (line in lines) {
+                if (isCancelled) {
+                    c.disconnect()
+                    break
+                }
                 val trimmed = line.trim()
-                if (!trimmed.startsWith("data:")) return@forEach
+                if (!trimmed.startsWith("data:")) continue
                 val payload = trimmed.removePrefix("data:").trim()
-                if (payload == "[DONE]") return@forEach
+                if (payload == "[DONE]") break
                 runCatching {
                     val delta = JSONObject(payload).optJSONArray("choices")
                         ?.optJSONObject(0)?.optJSONObject("delta")
@@ -201,219 +331,1440 @@ class ApiClient(private val baseUrl: String, private val apiKey: String, private
         return out.toString()
     }
 
-    fun image(model: String, prompt: String): ByteArray {
+    fun generateImage(model: String, prompt: String): ByteArray {
         val base = baseUrl.trimEnd('/')
-        val c = open("$base/v1/images/generations", "POST")
+        val c = openConnection("$base/v1/images/generations", "POST")
         c.doOutput = true
-        val body = JSONObject().put("model", model).put("prompt", prompt).put("response_format", "b64_json").toString()
-        c.outputStream.use { it.write(body.toByteArray()) }
-        if (c.responseCode !in 200..299) error("Image HTTP ${c.responseCode}")
+        val body = JSONObject().apply {
+            put("model", model)
+            put("prompt", prompt)
+            put("response_format", "b64_json")
+        }.toString()
+        c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        val code = c.responseCode
+        if (code !in 200..299) {
+            val err = c.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            c.disconnect()
+            throw IOException("Image HTTP $code: $err")
+        }
         val text = c.inputStream.bufferedReader().use { it.readText() }
         c.disconnect()
         val data = JSONObject(text).optJSONArray("data")?.optJSONObject(0)?.optString("b64_json")
-            ?: error("Image response missing b64_json")
+            ?: throw IOException("Image response missing b64_json payload")
         return Base64.decode(data, Base64.DEFAULT)
+    }
+
+    fun createApiKey(adminKey: String, name: String, expiresDays: Int?, rateLimit: Int?): Pair<JSONObject, String> {
+        val base = baseUrl.trimEnd('/')
+        val c = openConnection("$base/admin/keys", "POST", customApiKey = adminKey)
+        c.doOutput = true
+        val body = JSONObject().apply {
+            put("name", name)
+            if (expiresDays != null && expiresDays > 0) put("expires_in_days", expiresDays)
+            if (rateLimit != null && rateLimit > 0) put("rate_limit", rateLimit)
+        }.toString()
+        c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        val code = c.responseCode
+        if (code !in 200..299) {
+            val err = c.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            c.disconnect()
+            throw IOException("Admin HTTP $code: $err")
+        }
+        val text = c.inputStream.bufferedReader().use { it.readText() }
+        c.disconnect()
+        val res = JSONObject(text)
+        val secret = res.getString("key")
+        val meta = res.getJSONObject("key_metadata")
+        return Pair(meta, secret)
+    }
+
+    fun listApiKeys(adminKey: String): List<JSONObject> {
+        val base = baseUrl.trimEnd('/')
+        val c = openConnection("$base/admin/keys", "GET", customApiKey = adminKey)
+        val code = c.responseCode
+        if (code !in 200..299) {
+            val err = c.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            c.disconnect()
+            throw IOException("Admin HTTP $code: $err")
+        }
+        val text = c.inputStream.bufferedReader().use { it.readText() }
+        c.disconnect()
+        val arr = JSONObject(text).optJSONArray("data") ?: JSONArray()
+        val list = mutableListOf<JSONObject>()
+        for (i in 0 until arr.length()) {
+            arr.optJSONObject(i)?.let { list.add(it) }
+        }
+        return list
+    }
+
+    fun revokeApiKey(adminKey: String, keyId: String): Boolean {
+        val base = baseUrl.trimEnd('/')
+        val c = openConnection("$base/admin/keys/$keyId/revoke", "POST", customApiKey = adminKey)
+        val code = c.responseCode
+        c.disconnect()
+        return code in 200..299
+    }
+
+    fun rotateApiKey(adminKey: String, keyId: String): Pair<JSONObject, String> {
+        val base = baseUrl.trimEnd('/')
+        val c = openConnection("$base/admin/keys/$keyId/rotate", "POST", customApiKey = adminKey)
+        val code = c.responseCode
+        if (code !in 200..299) {
+            val err = c.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            c.disconnect()
+            throw IOException("Admin HTTP $code: $err")
+        }
+        val text = c.inputStream.bufferedReader().use { it.readText() }
+        c.disconnect()
+        val res = JSONObject(text)
+        return Pair(res.getJSONObject("key_metadata"), res.getString("key"))
     }
 }
 
 class MainActivity : Activity() {
     private lateinit var store: SecureStore
-    private lateinit var root: LinearLayout
-    private lateinit var messagesBox: LinearLayout
-    private lateinit var input: EditText
-    private lateinit var modelSpinner: Spinner
-    private lateinit var status: TextView
     private var api: ApiClient? = null
-    private val messages = mutableListOf<ChatMessage>()
-    private val executor = Executors.newSingleThreadExecutor()
+    private val executor = Executors.newCachedThreadPool()
+    private var activeCallFuture: Future<*>? = null
     private var tts: TextToSpeech? = null
+
+    // Chat sessions
+    private val sessions = mutableListOf<ChatSession>()
+    private var activeSession: ChatSession? = null
+
+    // UI elements
+    private lateinit var rootLayout: LinearLayout
+    private lateinit var statusBadge: TextView
+    private lateinit var modelSpinner: Spinner
+    private lateinit var messagesContainer: LinearLayout
+    private lateinit var chatScrollView: ScrollView
+    private lateinit var inputField: EditText
+    private lateinit var sendButton: Button
+    private lateinit var stopButton: Button
+    private lateinit var systemPromptBadge: TextView
+
+    private var isGenerating = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = SecureStore(this)
-        tts = TextToSpeech(this) { if (it == TextToSpeech.SUCCESS) tts?.language = Locale.getDefault() }
-        buildUi()
-        restoreHistory()
-        loadConfig()
+        tts = TextToSpeech(this) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                tts?.language = Locale.getDefault()
+            }
+        }
+
+        buildMainInterface()
+        loadSavedSessions()
+        initClient()
     }
 
-    private fun buildUi() {
-        root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 24, 24, 24) }
+    private fun buildMainInterface() {
+        rootLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#121212"))
+            setPadding(16, 16, 16, 16)
+        }
+
+        // Header Title Bar
+        val headerBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(8, 8, 8, 8)
+        }
         val title = TextView(this).apply {
-            text = "Private AI  •  Tor Gateway"
+            text = "Onion AI"
             textSize = 20f
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, 0, 0, 8)
+            setTextColor(Color.WHITE)
         }
-        status = TextView(this).apply {
-            text = "Not connected"
+        val subtitle = TextView(this).apply {
+            text = " • Private Tor Gateway"
             textSize = 13f
-            setPadding(0, 0, 0, 12)
+            setTextColor(Color.parseColor("#9E9E9E"))
+        }
+        headerBar.addView(title)
+        headerBar.addView(subtitle)
+        rootLayout.addView(headerBar)
+
+        // Status badge
+        statusBadge = TextView(this).apply {
+            text = "⚪ Initializing Tor Gateway..."
+            textSize = 12f
+            setPadding(16, 8, 16, 8)
+            setTextColor(Color.parseColor("#B0BEC5"))
+            background = createRoundedDrawable(Color.parseColor("#1E1E1E"), 12)
+        }
+        rootLayout.addView(statusBadge)
+
+        // Action Toolbar (Buttons: + New, 📚 History, 🔑 API/Developer, 🎨 Image, ⚡ Test, ⚙️ Config)
+        val toolbarScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            setPadding(0, 10, 0, 10)
+        }
+        val toolbarLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        fun createToolBtn(label: String, onClick: () -> Unit): Button {
+            return Button(this).apply {
+                text = label
+                textSize = 12f
+                setTextColor(Color.WHITE)
+                background = createRoundedDrawable(Color.parseColor("#263238"), 12)
+                setPadding(20, 8, 20, 8)
+                val params = LinearLayout.LayoutParams(-2, -2).apply { setMargins(4, 0, 4, 0) }
+                layoutParams = params
+                setOnClickListener { onClick() }
+            }
+        }
+
+        toolbarLayout.addView(createToolBtn("+ New Chat") { startNewChat() })
+        toolbarLayout.addView(createToolBtn("📚 History") { showHistoryDialog() })
+        toolbarLayout.addView(createToolBtn("🔑 API Access") { showDeveloperAccessDialog() })
+        toolbarLayout.addView(createToolBtn("🎨 Image") { showImagePromptDialog() })
+        toolbarLayout.addView(createToolBtn("⚡ Test Tor") { runConnectionTest() })
+        toolbarLayout.addView(createToolBtn("⚙️ Config") { showGatewayConfigDialog() })
+
+        toolbarScroll.addView(toolbarLayout)
+        rootLayout.addView(toolbarScroll)
+
+        // Model selector and System Prompt Row
+        val modelRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(4, 4, 4, 8)
+        }
+        val modelLabel = TextView(this).apply {
+            text = "Model: "
+            textSize = 13f
+            setTextColor(Color.parseColor("#9E9E9E"))
         }
         modelSpinner = Spinner(this).apply {
-            setPadding(0, 0, 0, 12)
+            val fallback = listOf("claude-3-7-sonnet-20250219", "gpt-4o", "private-chat-model")
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, fallback)
         }
-        messagesBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val scroll = ScrollView(this).apply { addView(messagesBox) }
-        input = EditText(this).apply {
-            hint = "Enter message for AI..."
-            minLines = 2
-            maxLines = 5
-        }
-        val send = Button(this).apply { text = "Send" }
-        val settings = Button(this).apply { text = "Custom API / Tor Config" }
-        val speak = Button(this).apply { text = "Speak Last Reply" }
-        val clear = Button(this).apply { text = "Clear History" }
-
-        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        bar.addView(send, LinearLayout.LayoutParams(0, -2, 1f))
-        bar.addView(speak, LinearLayout.LayoutParams(0, -2, 1f))
-
-        val bar2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        bar2.addView(settings, LinearLayout.LayoutParams(0, -2, 1f))
-        bar2.addView(clear, LinearLayout.LayoutParams(0, -2, 1f))
-
-        root.addView(title)
-        root.addView(status)
-        root.addView(modelSpinner)
-        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        root.addView(input)
-        root.addView(bar)
-        root.addView(bar2)
-        setContentView(root)
-
-        send.setOnClickListener { sendMessage() }
-        speak.setOnClickListener {
-            messages.lastOrNull { it.role == "assistant" }?.content?.let {
-                tts?.speak(it, TextToSpeech.QUEUE_FLUSH, null, "last")
-            }
-        }
-        settings.setOnClickListener { showSettings() }
-        clear.setOnClickListener {
-            messages.clear()
-            messagesBox.removeAllViews()
-            store.put(KEY_BLOB, "[]")
-            status.text = "History cleared"
-        }
-    }
-
-    private fun addBubble(text: String, role: String) {
-        val v = TextView(this).apply {
-            this.text = if (role == "user") "You\n$text" else "AI\n$text"
-            textSize = 15f
-            setPadding(20, 16, 20, 16)
-            setBackgroundResource(android.R.drawable.dialog_holo_light_frame)
-        }
-        val params = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            setMargins(0, 8, 0, 8)
-        }
-        messagesBox.addView(v, params)
-        (messagesBox.parent as? ScrollView)?.post { (messagesBox.parent as ScrollView).fullScroll(View.FOCUS_DOWN) }
-    }
-
-    private fun restoreHistory() {
-        val saved = store.get(KEY_BLOB) ?: return
-        runCatching {
-            val arr = JSONArray(saved)
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                val role = obj.optString("role", "user")
-                val content = obj.optString("content", "")
-                if (content.isNotEmpty()) {
-                    messages += ChatMessage(role, content)
-                    addBubble(content, role)
-                }
-            }
-        }
-    }
-
-    private fun sendMessage() {
-        val text = input.text.toString().trim()
-        if (text.isEmpty()) return
-        val client = api ?: run { showSettings(); return }
-        val model = modelSpinner.selectedItem?.toString().orEmpty()
-        if (model.isBlank()) { status.text = "Select a model"; return }
-        input.setText("")
-        messages += ChatMessage("user", text)
-        addBubble(text, "user")
-        val aiBubble = TextView(this).apply {
-            this.text = "AI\n"
-            textSize = 15f
-            setPadding(20, 16, 20, 16)
-            setBackgroundResource(android.R.drawable.dialog_holo_light_frame)
-        }
-        val params = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            setMargins(0, 8, 0, 8)
-        }
-        messagesBox.addView(aiBubble, params)
-
-        executor.execute {
-            runCatching {
-                val reply = client.chat(model, messages) { token ->
-                    runOnUiThread { aiBubble.append(token) }
-                }
-                messages += ChatMessage("assistant", reply)
-                store.put(KEY_BLOB, JSONArray(messages.map { JSONObject().put("role", it.role).put("content", it.content) }).toString())
-            }.onFailure { e ->
-                runOnUiThread { status.text = "Error: ${e.message}" }
-            }
-        }
-    }
-
-    private fun showSettings() {
-        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 16, 24, 16) }
-        val url = EditText(this).apply { hint = "https://your-service.onion"; setText(store.get("url").orEmpty()) }
-        val key = EditText(this).apply { hint = "Gateway API Key (optional)"; setText(store.get("key").orEmpty()); inputType = 0x00000081 }
-        val port = EditText(this).apply { hint = "Tor SOCKS port (e.g. 9050)"; setText(store.get("port") ?: "9050"); inputType = 2 }
-        val note = TextView(this).apply {
-            text = "Strict Tor Security: Only .onion endpoints are permitted over local SOCKS proxy (127.0.0.1). Clear-net requests are strictly blocked."
+        systemPromptBadge = TextView(this).apply {
+            text = "⚙️ System Prompt"
             textSize = 12f
+            setTextColor(Color.parseColor("#80CBC4"))
+            setPadding(12, 6, 12, 6)
+            background = createRoundedDrawable(Color.parseColor("#1B2A28"), 8)
+            setOnClickListener { showSystemPromptDialog() }
+        }
+
+        modelRow.addView(modelLabel)
+        modelRow.addView(modelSpinner, LinearLayout.LayoutParams(0, -2, 1f))
+        modelRow.addView(systemPromptBadge)
+        rootLayout.addView(modelRow)
+
+        // Messages Box
+        messagesContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        chatScrollView = ScrollView(this).apply {
+            addView(messagesContainer)
+            isFillViewport = true
+        }
+        rootLayout.addView(chatScrollView, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        // Bottom Input Bar
+        val bottomBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.BOTTOM
             setPadding(0, 8, 0, 0)
         }
-        box.addView(url); box.addView(key); box.addView(port); box.addView(note)
-        AlertDialog.Builder(this).setTitle("Custom Onion Gateway").setView(box)
-            .setNegativeButton("Cancel", null)
-            .setPositiveButton("Connect") { _, _ ->
-                val p = port.text.toString().toIntOrNull() ?: 9050
-                val targetUrl = url.text.toString().trim()
-                val targetKey = key.text.toString().trim()
-                store.put("url", targetUrl)
-                store.put("key", targetKey)
-                store.put("port", p.toString())
-                
-                try {
-                    api = ApiClient(targetUrl, targetKey, p)
-                    status.text = "Connecting via Tor SOCKS..."
-                    executor.execute {
-                        runCatching { api!!.models() }.onSuccess { models ->
-                            runOnUiThread {
-                                modelSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, models)
-                                status.text = "Connected • ${models.size} model(s) available"
-                            }
-                        }.onFailure { e ->
-                            runOnUiThread { status.text = "Connection failed: ${e.message}" }
-                        }
-                    }
-                } catch (e: Exception) {
-                    status.text = "Config error: ${e.message}"
-                }
-            }.show()
+        inputField = EditText(this).apply {
+            hint = "Message AI via Tor..."
+            setHintTextColor(Color.parseColor("#757575"))
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            minLines = 1
+            maxLines = 4
+            background = createRoundedDrawable(Color.parseColor("#1E1E1E"), 12)
+            setPadding(16, 14, 16, 14)
+        }
+        sendButton = Button(this).apply {
+            text = "Send"
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#37474F"), 12)
+            setOnClickListener { handleSendMessage() }
+        }
+        stopButton = Button(this).apply {
+            text = "Stop"
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#C62828"), 12)
+            visibility = View.GONE
+            setOnClickListener { stopGeneration() }
+        }
+
+        bottomBar.addView(inputField, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(0, 0, 8, 0) })
+        bottomBar.addView(sendButton, LinearLayout.LayoutParams(-2, -2))
+        bottomBar.addView(stopButton, LinearLayout.LayoutParams(-2, -2))
+
+        rootLayout.addView(bottomBar)
+        setContentView(rootLayout)
     }
 
-    private fun loadConfig() {
-        val url = store.get("url").orEmpty()
-        if (url.isNotBlank()) {
-            val key = store.get("key").orEmpty()
-            val port = store.get("port")?.toIntOrNull() ?: 9050
+    private fun createRoundedDrawable(color: Int, radiusDp: Int, borderColor: Int = Color.TRANSPARENT, borderWidth: Int = 0): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = radiusDp * resources.displayMetrics.density
+            if (borderWidth > 0) {
+                setStroke((borderWidth * resources.displayMetrics.density).toInt(), borderColor)
+            }
+        }
+    }
+
+    private fun initClient() {
+        val url = store.get(KEY_URL) ?: "http://samplegatewayonion1234567890.onion"
+        val key = store.get(KEY_CLIENT_KEY) ?: ""
+        val port = store.get(KEY_SOCKS_PORT)?.toIntOrNull() ?: 9050
+        val allowDev = store.getBoolean(KEY_ALLOW_DEV_LOOPBACK, false)
+
+        api = ApiClient(url, key, port, allowDev)
+        refreshGatewayStatus()
+    }
+
+    private fun refreshGatewayStatus() {
+        val client = api ?: return
+        statusBadge.text = "🟡 Checking Tor SOCKS proxy (127.0.0.1:${client.socksPort})..."
+        statusBadge.setTextColor(Color.parseColor("#FFD54F"))
+
+        executor.execute {
+            val socksUp = client.testTorSocksPort()
+            if (!socksUp) {
+                runOnUiThread {
+                    statusBadge.text = "🟡 Tor SOCKS Offline (Start Orbot/Tor on port ${client.socksPort})"
+                    statusBadge.setTextColor(Color.parseColor("#FFB74D"))
+                }
+                return@execute
+            }
+
             runCatching {
-                api = ApiClient(url, key, port)
-                executor.execute {
-                    runCatching { api!!.models() }.onSuccess { models ->
-                        runOnUiThread {
-                            modelSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, models)
-                            status.text = "Connected • ${models.size} model(s) available"
+                val health = client.health()
+                val models = client.models()
+                runOnUiThread {
+                    statusBadge.text = "🟢 Tor Connected • Gateway Ready (${models.size} models)"
+                    statusBadge.setTextColor(Color.parseColor("#81C784"))
+                    if (models.isNotEmpty()) {
+                        val prevSelected = store.get(KEY_LAST_MODEL)
+                        val adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, models)
+                        modelSpinner.adapter = adapter
+                        if (prevSelected != null && models.contains(prevSelected)) {
+                            modelSpinner.setSelection(models.indexOf(prevSelected))
                         }
                     }
+                }
+            }.onFailure { err ->
+                runOnUiThread {
+                    val msg = err.message.orEmpty()
+                    when {
+                        msg.contains("401") || msg.contains("authentication", true) -> {
+                            statusBadge.text = "⚠️ Authentication Failed (Check API Key)"
+                            statusBadge.setTextColor(Color.parseColor("#E57373"))
+                        }
+                        msg.contains("Tor-Only Policy") -> {
+                            statusBadge.text = "🛑 Tor-Only Violation (Non-onion address)"
+                            statusBadge.setTextColor(Color.parseColor("#E57373"))
+                        }
+                        else -> {
+                            statusBadge.text = "🔴 Gateway Unreachable via Tor (${err.javaClass.simpleName})"
+                            statusBadge.setTextColor(Color.parseColor("#E57373"))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun startNewChat() {
+        saveCurrentSession()
+        val newSession = ChatSession()
+        sessions.add(0, newSession)
+        activeSession = newSession
+        store.put(KEY_ACTIVE_SESSION_ID, newSession.id)
+        messagesContainer.removeAllViews()
+        renderWelcomeMessage()
+    }
+
+    private fun renderWelcomeMessage() {
+        val welcome = TextView(this).apply {
+            text = "Welcome to Onion AI\n\n• End-to-end anonymity over the Tor network\n• Local Keystore-encrypted vault\n• Anthropic & OpenAI gateway compatibility\n• PocketForge agent gateway ready"
+            textSize = 14f
+            setTextColor(Color.parseColor("#90A4AE"))
+            setPadding(24, 24, 24, 24)
+            background = createRoundedDrawable(Color.parseColor("#1E2426"), 12)
+        }
+        val params = LinearLayout.LayoutParams(-1, -2).apply { setMargins(8, 16, 8, 16) }
+        messagesContainer.addView(welcome, params)
+    }
+
+    private fun loadSavedSessions() {
+        val raw = store.get(KEY_SESSIONS)
+        sessions.clear()
+        if (!raw.isNullOrBlank()) {
+            runCatching {
+                val arr = JSONArray(raw)
+                for (i in 0 until arr.length()) {
+                    val sObj = arr.getJSONObject(i)
+                    val s = ChatSession(
+                        id = sObj.getString("id"),
+                        title = sObj.optString("title", "Chat"),
+                        createdAt = sObj.optLong("createdAt", System.currentTimeMillis())
+                    )
+                    val mArr = sObj.optJSONArray("messages") ?: JSONArray()
+                    for (j in 0 until mArr.length()) {
+                        val mObj = mArr.getJSONObject(j)
+                        s.messages.add(
+                            ChatMessage(
+                                id = mObj.optString("id", UUID.randomUUID().toString()),
+                                role = mObj.getString("role"),
+                                content = mObj.getString("content"),
+                                timestamp = mObj.optLong("timestamp", System.currentTimeMillis())
+                            )
+                        )
+                    }
+                    sessions.add(s)
+                }
+            }
+        }
+
+        val activeId = store.get(KEY_ACTIVE_SESSION_ID)
+        activeSession = sessions.firstOrNull { it.id == activeId } ?: sessions.firstOrNull()
+        if (activeSession == null) {
+            startNewChat()
+        } else {
+            renderSessionMessages(activeSession!!)
+        }
+    }
+
+    private fun saveCurrentSession() {
+        val arr = JSONArray()
+        sessions.forEach { s ->
+            val sObj = JSONObject().apply {
+                put("id", s.id)
+                put("title", s.title)
+                put("createdAt", s.createdAt)
+                val mArr = JSONArray()
+                s.messages.forEach { m ->
+                    mArr.put(JSONObject().apply {
+                        put("id", m.id)
+                        put("role", m.role)
+                        put("content", m.content)
+                        put("timestamp", m.timestamp)
+                    })
+                }
+                put("messages", mArr)
+            }
+            arr.put(sObj)
+        }
+        store.put(KEY_SESSIONS, arr.toString())
+    }
+
+    private fun renderSessionMessages(session: ChatSession) {
+        messagesContainer.removeAllViews()
+        if (session.messages.isEmpty()) {
+            renderWelcomeMessage()
+            return
+        }
+        session.messages.forEach { msg ->
+            addMessageView(msg)
+        }
+        scrollChatToBottom()
+    }
+
+    private fun handleSendMessage(prefilledText: String? = null) {
+        val text = prefilledText ?: inputField.text.toString().trim()
+        if (text.isEmpty()) return
+
+        val client = api ?: run {
+            showGatewayConfigDialog()
+            return
+        }
+
+        val selectedModel = modelSpinner.selectedItem?.toString().orEmpty()
+        if (selectedModel.isBlank()) {
+            Toast.makeText(this, "Please select an AI model", Toast.LENGTH_SHORT).show()
+            return
+        }
+        store.put(KEY_LAST_MODEL, selectedModel)
+
+        if (prefilledText == null) {
+            inputField.setText("")
+        }
+
+        val currentSession = activeSession ?: return
+        if (currentSession.messages.isEmpty()) {
+            currentSession.title = if (text.length > 28) text.take(28) + "..." else text
+        }
+
+        val userMsg = ChatMessage(role = "user", content = text)
+        currentSession.messages.add(userMsg)
+        addMessageView(userMsg)
+        saveCurrentSession()
+
+        // Prepare Assistant placeholder
+        val assistantMsg = ChatMessage(role = "assistant", content = "")
+        currentSession.messages.add(assistantMsg)
+        val assistantView = addMessageView(assistantMsg, isStreaming = true)
+
+        val systemPrompt = store.get(KEY_SYSTEM_PROMPT) ?: ""
+
+        // State update for generation
+        isGenerating = true
+        sendButton.visibility = View.GONE
+        stopButton.visibility = View.VISIBLE
+
+        activeCallFuture = executor.submit {
+            val fullResponse = StringBuilder()
+            val textContainer = assistantView.findViewById<TextView>(R_ID_STREAMING_TEXT)
+
+            runCatching {
+                client.chatStream(selectedModel, systemPrompt, currentSession.messages.dropLast(1)) { delta ->
+                    fullResponse.append(delta)
+                    runOnUiThread {
+                        textContainer?.text = fullResponse.toString()
+                        scrollChatToBottom()
+                    }
+                }
+                val finalText = fullResponse.toString()
+                runOnUiThread {
+                    assistantMsg.let {
+                        val index = currentSession.messages.indexOf(assistantMsg)
+                        if (index >= 0) {
+                            currentSession.messages[index] = assistantMsg.copy(content = finalText)
+                        }
+                    }
+                    saveCurrentSession()
+                    renderSessionMessages(currentSession)
+                    finishGeneration()
+                }
+            }.onFailure { err ->
+                runOnUiThread {
+                    if (client.isCancelled) {
+                        textContainer?.append("\n[Generation Stopped]")
+                    } else {
+                        textContainer?.append("\n[Error: ${err.message}]")
+                    }
+                    finishGeneration()
+                }
+            }
+        }
+    }
+
+    private fun stopGeneration() {
+        api?.isCancelled = true
+        activeCallFuture?.cancel(true)
+        finishGeneration()
+    }
+
+    private fun finishGeneration() {
+        isGenerating = false
+        sendButton.visibility = View.VISIBLE
+        stopButton.visibility = View.GONE
+    }
+
+    private val R_ID_STREAMING_TEXT = 999991
+
+    private fun addMessageView(msg: ChatMessage, isStreaming: Boolean = false): View {
+        val isUser = msg.role == "user"
+        val wrapper = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = if (isUser) Gravity.END else Gravity.START
+            val p = LinearLayout.LayoutParams(-1, -2).apply {
+                setMargins(if (isUser) 48 else 0, 10, if (isUser) 0 else 48, 10)
+            }
+            layoutParams = p
+        }
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(18, 14, 18, 14)
+            background = if (isUser) {
+                createRoundedDrawable(Color.parseColor("#263238"), 14, Color.parseColor("#37474F"), 1)
+            } else {
+                createRoundedDrawable(Color.parseColor("#1E1E1E"), 14, Color.parseColor("#2C2C2C"), 1)
+            }
+        }
+
+        val senderLabel = TextView(this).apply {
+            text = if (isUser) "You" else "Onion AI"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(if (isUser) Color.parseColor("#80CBC4") else Color.parseColor("#B388FF"))
+            setPadding(0, 0, 0, 6)
+        }
+        card.addView(senderLabel)
+
+        if (isStreaming) {
+            val streamingText = TextView(this).apply {
+                id = R_ID_STREAMING_TEXT
+                text = "Thinking..."
+                textSize = 14f
+                setTextColor(Color.parseColor("#ECEFF1"))
+                setLineSpacing(6f, 1f)
+            }
+            card.addView(streamingText)
+        } else {
+            // Render content with code block detection
+            renderFormattedContent(card, msg.content)
+        }
+
+        // Action Buttons Row (Copy, Share, Speak, Regenerate, Edit)
+        val actionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+            setPadding(0, 8, 0, 0)
+        }
+
+        fun createActionBtn(label: String, onClick: () -> Unit): TextView {
+            return TextView(this).apply {
+                text = label
+                textSize = 11f
+                setTextColor(Color.parseColor("#90A4AE"))
+                setPadding(14, 6, 14, 6)
+                background = createRoundedDrawable(Color.parseColor("#2A2A2A"), 6)
+                val params = LinearLayout.LayoutParams(-2, -2).apply { setMargins(6, 0, 0, 0) }
+                layoutParams = params
+                setOnClickListener { onClick() }
+            }
+        }
+
+        actionRow.addView(createActionBtn("📋 Copy") {
+            copyToClipboard("Message", msg.content)
+            Toast.makeText(this, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+        })
+
+        if (!isUser) {
+            actionRow.addView(createActionBtn("📤 Share") {
+                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, msg.content)
+                }
+                startActivity(Intent.createChooser(shareIntent, "Share AI Response"))
+            })
+
+            actionRow.addView(createActionBtn("🔊 Speak") {
+                tts?.speak(msg.content, TextToSpeech.QUEUE_FLUSH, null, msg.id)
+            })
+
+            actionRow.addView(createActionBtn("🔄 Retry") {
+                // Regenerate: remove this assistant message and resend last user message
+                val s = activeSession ?: return@createActionBtn
+                val idx = s.messages.indexOf(msg)
+                if (idx > 0 && s.messages[idx - 1].role == "user") {
+                    val prompt = s.messages[idx - 1].content
+                    s.messages.removeAt(idx)
+                    s.messages.removeAt(idx - 1)
+                    renderSessionMessages(s)
+                    handleSendMessage(prompt)
+                }
+            })
+        } else {
+            actionRow.addView(createActionBtn("✏️ Edit") {
+                inputField.setText(msg.content)
+                inputField.setSelection(msg.content.length)
+                // Remove this message and subsequent messages
+                val s = activeSession ?: return@createActionBtn
+                val idx = s.messages.indexOf(msg)
+                if (idx >= 0) {
+                    while (s.messages.size > idx) {
+                        s.messages.removeAt(s.messages.size - 1)
+                    }
+                    renderSessionMessages(s)
+                }
+            })
+        }
+
+        card.addView(actionRow)
+        wrapper.addView(card)
+        messagesContainer.addView(wrapper)
+        scrollChatToBottom()
+        return wrapper
+    }
+
+    private fun renderFormattedContent(container: LinearLayout, text: String) {
+        val parts = text.split("```")
+        for (i in parts.indices) {
+            val part = parts[i]
+            if (part.isBlank()) continue
+
+            if (i % 2 == 1) {
+                // Code block
+                val firstLineEnd = part.indexOf('\n')
+                val lang = if (firstLineEnd in 1..20) part.substring(0, firstLineEnd).trim() else "code"
+                val codeBody = if (firstLineEnd != -1) part.substring(firstLineEnd + 1).trimEnd() else part
+
+                val codeBox = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    background = createRoundedDrawable(Color.parseColor("#0D1117"), 8, Color.parseColor("#30363D"), 1)
+                    setPadding(14, 10, 14, 10)
+                    val p = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 8, 0, 8) }
+                    layoutParams = p
+                }
+
+                val header = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                }
+                val langLabel = TextView(this).apply {
+                    this.text = lang.uppercase(Locale.ROOT)
+                    textSize = 11f
+                    typeface = Typeface.MONOSPACE
+                    setTextColor(Color.parseColor("#79C0FF"))
+                }
+                val copyCodeBtn = TextView(this).apply {
+                    this.text = "📋 Copy Code"
+                    textSize = 11f
+                    setTextColor(Color.parseColor("#8B949E"))
+                    setPadding(8, 4, 8, 4)
+                    setOnClickListener {
+                        copyToClipboard("Code", codeBody)
+                        Toast.makeText(this@MainActivity, "Code copied", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                header.addView(langLabel, LinearLayout.LayoutParams(0, -2, 1f))
+                header.addView(copyCodeBtn)
+                codeBox.addView(header)
+
+                val codeScroll = HorizontalScrollView(this)
+                val codeView = TextView(this).apply {
+                    this.text = codeBody
+                    textSize = 13f
+                    typeface = Typeface.MONOSPACE
+                    setTextColor(Color.parseColor("#E6EDF3"))
+                    setPadding(0, 8, 0, 0)
+                }
+                codeScroll.addView(codeView)
+                codeBox.addView(codeScroll)
+                container.addView(codeBox)
+            } else {
+                // Regular prose
+                val proseView = TextView(this).apply {
+                    this.text = part.trim()
+                    textSize = 14.5f
+                    setTextColor(Color.parseColor("#ECEFF1"))
+                    setLineSpacing(6f, 1f)
+                    setPadding(0, 4, 0, 4)
+                }
+                container.addView(proseView)
+            }
+        }
+    }
+
+    private fun scrollChatToBottom() {
+        chatScrollView.post {
+            chatScrollView.fullScroll(View.FOCUS_DOWN)
+        }
+    }
+
+    private fun copyToClipboard(label: String, content: String) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = ClipData.newPlainText(label, content)
+        clipboard.setPrimaryClip(clip)
+    }
+
+    // --- DIALOGS: HISTORY, CONFIG, DEVELOPER ACCESS, SYSTEM PROMPT, IMAGE, TESTS ---
+
+    private fun showHistoryDialog() {
+        val dialogView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 16, 24, 16)
+        }
+
+        val scroll = ScrollView(this)
+        val listLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        if (sessions.isEmpty()) {
+            val empty = TextView(this).apply {
+                text = "No saved conversations."
+                textSize = 14f
+                setPadding(0, 20, 0, 20)
+                setTextColor(Color.GRAY)
+            }
+            listLayout.addView(empty)
+        } else {
+            val dateFormat = SimpleDateFormat("MMM dd, HH:mm", Locale.getDefault())
+            sessions.forEach { session ->
+                val item = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(16, 12, 16, 12)
+                    background = createRoundedDrawable(Color.parseColor("#222222"), 8)
+                    val p = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 4, 0, 4) }
+                    layoutParams = p
+                }
+
+                val titleCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                val titleText = TextView(this).apply {
+                    text = session.title
+                    textSize = 14f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.WHITE)
+                }
+                val subText = TextView(this).apply {
+                    text = "${session.messages.size} msgs • ${dateFormat.format(Date(session.createdAt))}"
+                    textSize = 11f
+                    setTextColor(Color.LTGRAY)
+                }
+                titleCol.addView(titleText)
+                titleCol.addView(subText)
+
+                val delBtn = Button(this).apply {
+                    text = "✕"
+                    textSize = 12f
+                    setTextColor(Color.parseColor("#EF5350"))
+                    background = null
+                }
+
+                item.addView(titleCol, LinearLayout.LayoutParams(0, -2, 1f))
+                item.addView(delBtn)
+
+                item.setOnClickListener {
+                    activeSession = session
+                    store.put(KEY_ACTIVE_SESSION_ID, session.id)
+                    renderSessionMessages(session)
+                }
+
+                delBtn.setOnClickListener {
+                    sessions.remove(session)
+                    saveCurrentSession()
+                    if (activeSession?.id == session.id) {
+                        activeSession = sessions.firstOrNull()
+                        if (activeSession == null) startNewChat() else renderSessionMessages(activeSession!!)
+                    }
+                    showHistoryDialog()
+                }
+
+                listLayout.addView(item)
+            }
+        }
+
+        scroll.addView(listLayout)
+        dialogView.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        val clearAllBtn = Button(this).apply {
+            text = "Clear All Sessions"
+            setTextColor(Color.parseColor("#EF5350"))
+            setOnClickListener {
+                sessions.clear()
+                store.put(KEY_SESSIONS, "[]")
+                startNewChat()
+            }
+        }
+        dialogView.addView(clearAllBtn)
+
+        AlertDialog.Builder(this)
+            .setTitle("Conversation History")
+            .setView(dialogView)
+            .setPositiveButton("Close", null)
+            .show()
+    }
+
+    private fun showSystemPromptDialog() {
+        val input = EditText(this).apply {
+            hint = "e.g. You are Claude Code, an expert agentic software engineer."
+            setText(store.get(KEY_SYSTEM_PROMPT).orEmpty())
+            minLines = 4
+            maxLines = 8
+            textSize = 14f
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Custom System Prompt")
+            .setView(input)
+            .setPositiveButton("Save") { _, _ ->
+                val prompt = input.text.toString().trim()
+                store.put(KEY_SYSTEM_PROMPT, prompt)
+                Toast.makeText(this, "System prompt saved", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Clear") { _, _ ->
+                store.put(KEY_SYSTEM_PROMPT, "")
+                Toast.makeText(this, "System prompt reset", Toast.LENGTH_SHORT).show()
+            }
+            .show()
+    }
+
+    private fun showGatewayConfigDialog() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(30, 20, 30, 20)
+        }
+
+        val urlInput = EditText(this).apply {
+            hint = "http://privacyai123456789.onion:8000"
+            setText(store.get(KEY_URL).orEmpty())
+        }
+        val keyInput = EditText(this).apply {
+            hint = "Client API Key (sk-priv-...)"
+            setText(store.get(KEY_CLIENT_KEY).orEmpty())
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val adminKeyInput = EditText(this).apply {
+            hint = "Admin Key (for managing API keys)"
+            setText(store.get(KEY_ADMIN_KEY).orEmpty())
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val portInput = EditText(this).apply {
+            hint = "Tor SOCKS Port (default 9050)"
+            setText(store.get(KEY_SOCKS_PORT) ?: "9050")
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val devCheck = CheckBox(this).apply {
+            text = "Allow Dev Loopback (127.0.0.1 / 10.0.2.2 only)"
+            isChecked = store.getBoolean(KEY_ALLOW_DEV_LOOPBACK, false)
+        }
+
+        val note = TextView(this).apply {
+            text = "Strict Tor Security: Non-.onion URLs are strictly blocked in production. Traffic is routed exclusively through local Tor SOCKS proxy (127.0.0.1)."
+            textSize = 11f
+            setTextColor(Color.parseColor("#90A4AE"))
+            setPadding(0, 10, 0, 0)
+        }
+
+        box.addView(TextView(this).apply { text = "Gateway .onion URL:"; textSize = 12f })
+        box.addView(urlInput)
+        box.addView(TextView(this).apply { text = "Client API Key:"; textSize = 12f })
+        box.addView(keyInput)
+        box.addView(TextView(this).apply { text = "Admin Master Key:"; textSize = 12f })
+        box.addView(adminKeyInput)
+        box.addView(TextView(this).apply { text = "Tor SOCKS Port:"; textSize = 12f })
+        box.addView(portInput)
+        box.addView(devCheck)
+        box.addView(note)
+
+        AlertDialog.Builder(this)
+            .setTitle("Tor Gateway Configuration")
+            .setView(box)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Save & Connect") { _, _ ->
+                val url = urlInput.text.toString().trim()
+                val key = keyInput.text.toString().trim()
+                val adminKey = adminKeyInput.text.toString().trim()
+                val port = portInput.text.toString().toIntOrNull() ?: 9050
+                val allowDev = devCheck.isChecked
+
+                store.put(KEY_URL, url)
+                store.put(KEY_CLIENT_KEY, key)
+                store.put(KEY_ADMIN_KEY, adminKey)
+                store.put(KEY_SOCKS_PORT, port.toString())
+                store.putBoolean(KEY_ALLOW_DEV_LOOPBACK, allowDev)
+
+                initClient()
+            }
+            .show()
+    }
+
+    private fun showDeveloperAccessDialog() {
+        val client = api ?: run {
+            showGatewayConfigDialog()
+            return
+        }
+
+        val dialogView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(26, 16, 26, 16)
+        }
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        val baseUrl = client.baseUrl.trimEnd('/')
+        val selectedModel = modelSpinner.selectedItem?.toString().orEmpty().ifEmpty { "claude-3-7-sonnet-20250219" }
+        val currentKey = client.apiKey.ifEmpty { "[Your-API-Key]" }
+
+        val title = TextView(this).apply {
+            text = "Developer / PocketForge Access"
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        }
+        val desc = TextView(this).apply {
+            text = "Connect PocketForge or Claude Code to this private Onion Gateway. App 1 does not need to stay open."
+            textSize = 12f
+            setTextColor(Color.parseColor("#90A4AE"))
+            setPadding(0, 4, 0, 14)
+        }
+        content.addView(title)
+        content.addView(desc)
+
+        // PocketForge Configuration Snippet Card
+        val snippetCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = createRoundedDrawable(Color.parseColor("#1B2A32"), 10, Color.parseColor("#37474F"), 1)
+            setPadding(16, 14, 16, 14)
+        }
+        val snippetTitle = TextView(this).apply {
+            text = "PocketForge / Claude Code Configuration:"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#80CBC4"))
+        }
+        val configSnippet = """
+Provider: Custom
+Protocol: Anthropic-compatible
+Base URL: $baseUrl
+API Key: $currentKey
+Model: $selectedModel
+        """.trimIndent()
+
+        val snippetText = TextView(this).apply {
+            text = configSnippet
+            typeface = Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            setPadding(0, 8, 0, 8)
+        }
+        val copySnippetBtn = Button(this).apply {
+            text = "📋 Copy Configuration"
+            textSize = 12f
+            setOnClickListener {
+                copyToClipboard("PocketForge Config", configSnippet)
+                Toast.makeText(this@MainActivity, "Configuration copied to clipboard", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        snippetCard.addView(snippetTitle)
+        snippetCard.addView(snippetText)
+        snippetCard.addView(copySnippetBtn)
+        content.addView(snippetCard)
+
+        // Direct Endpoints
+        content.addView(TextView(this).apply {
+            text = "\nDirect API Endpoints:"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        })
+
+        fun addEndpointRow(label: String, path: String) {
+            val fullEp = "$baseUrl$path"
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 4, 0, 4)
+            }
+            val epText = TextView(this).apply {
+                text = "$label:\n$fullEp"
+                textSize = 11f
+                typeface = Typeface.MONOSPACE
+                setTextColor(Color.parseColor("#B0BEC5"))
+            }
+            val copyBtn = TextView(this).apply {
+                text = "📋 Copy"
+                textSize = 11f
+                setTextColor(Color.parseColor("#80CBC4"))
+                setPadding(10, 6, 10, 6)
+                setOnClickListener {
+                    copyToClipboard(label, fullEp)
+                    Toast.makeText(this@MainActivity, "$label copied", Toast.LENGTH_SHORT).show()
+                }
+            }
+            row.addView(epText, LinearLayout.LayoutParams(0, -2, 1f))
+            row.addView(copyBtn)
+            content.addView(row)
+        }
+
+        addEndpointRow("Anthropic Messages", "/v1/messages")
+        addEndpointRow("OpenAI Completions", "/v1/chat/completions")
+        addEndpointRow("Models", "/v1/models")
+
+        // API Key Management Section
+        content.addView(TextView(this).apply {
+            text = "\nGateway API Key Management:"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        })
+
+        val keyListContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        val createKeyBtn = Button(this).apply {
+            text = "+ Generate New Key for PocketForge"
+            textSize = 12f
+            setOnClickListener {
+                showCreateKeyPrompt { refreshKeysList(keyListContainer) }
+            }
+        }
+        content.addView(createKeyBtn)
+        content.addView(keyListContainer)
+
+        refreshKeysList(keyListContainer)
+
+        scroll.addView(content)
+        dialogView.addView(scroll)
+
+        AlertDialog.Builder(this)
+            .setView(dialogView)
+            .setPositiveButton("Done", null)
+            .show()
+    }
+
+    private fun refreshKeysList(container: LinearLayout) {
+        val client = api ?: return
+        val adminKey = store.get(KEY_ADMIN_KEY).orEmpty()
+        container.removeAllViews()
+
+        if (adminKey.isBlank()) {
+            val notice = TextView(this).apply {
+                text = "Set Admin Key in 'Config' to manage gateway API keys."
+                textSize = 11f
+                setTextColor(Color.parseColor("#FFB74D"))
+                setPadding(0, 8, 0, 8)
+            }
+            container.addView(notice)
+            return
+        }
+
+        executor.execute {
+            runCatching { client.listApiKeys(adminKey) }.onSuccess { keys ->
+                runOnUiThread {
+                    if (keys.isEmpty()) {
+                        container.addView(TextView(this).apply {
+                            text = "No active keys registered on gateway."
+                            textSize = 11f
+                            setTextColor(Color.GRAY)
+                            setPadding(0, 8, 0, 8)
+                        })
+                    } else {
+                        keys.forEach { k ->
+                            val id = k.optString("id")
+                            val name = k.optString("name", id)
+                            val enabled = k.optBoolean("enabled", true)
+
+                            val kRow = LinearLayout(this).apply {
+                                orientation = LinearLayout.HORIZONTAL
+                                gravity = Gravity.CENTER_VERTICAL
+                                setPadding(10, 8, 10, 8)
+                                background = createRoundedDrawable(Color.parseColor("#1C1C1C"), 6)
+                                val p = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 4, 0, 4) }
+                                layoutParams = p
+                            }
+                            val info = TextView(this).apply {
+                                text = "$name (${if (enabled) "Active" else "Revoked"})\nID: $id"
+                                textSize = 11f
+                                setTextColor(if (enabled) Color.WHITE else Color.GRAY)
+                            }
+                            val revokeBtn = TextView(this).apply {
+                                text = if (enabled) "Revoke" else "Revoked"
+                                textSize = 11f
+                                setTextColor(if (enabled) Color.parseColor("#EF5350") else Color.GRAY)
+                                setPadding(8, 4, 8, 4)
+                                if (enabled) {
+                                    setOnClickListener {
+                                        executor.execute {
+                                            client.revokeApiKey(adminKey, id)
+                                            runOnUiThread { refreshKeysList(container) }
+                                        }
+                                    }
+                                }
+                            }
+                            val rotateBtn = TextView(this).apply {
+                                text = "Rotate"
+                                textSize = 11f
+                                setTextColor(Color.parseColor("#64B5F6"))
+                                setPadding(8, 4, 8, 4)
+                                setOnClickListener {
+                                    executor.execute {
+                                        runCatching { client.rotateApiKey(adminKey, id) }.onSuccess { pair ->
+                                            runOnUiThread {
+                                                showCreatedKeyDialog(pair.second)
+                                                refreshKeysList(container)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            kRow.addView(info, LinearLayout.LayoutParams(0, -2, 1f))
+                            if (enabled) kRow.addView(rotateBtn)
+                            kRow.addView(revokeBtn)
+                            container.addView(kRow)
+                        }
+                    }
+                }
+            }.onFailure { e ->
+                runOnUiThread {
+                    container.addView(TextView(this).apply {
+                        text = "Could not fetch keys: ${e.message}"
+                        textSize = 11f
+                        setTextColor(Color.parseColor("#EF5350"))
+                    })
+                }
+            }
+        }
+    }
+
+    private fun showCreateKeyPrompt(onSuccess: () -> Unit) {
+        val client = api ?: return
+        val adminKey = store.get(KEY_ADMIN_KEY).orEmpty()
+        if (adminKey.isBlank()) {
+            Toast.makeText(this, "Please set Admin Key in Config first.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 16, 24, 16)
+        }
+        val nameInput = EditText(this).apply { hint = "Key Label (e.g. PocketForge Agent)" }
+        val limitInput = EditText(this).apply {
+            hint = "Rate limit (requests/min, default 60)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        box.addView(nameInput)
+        box.addView(limitInput)
+
+        AlertDialog.Builder(this)
+            .setTitle("Create Gateway API Key")
+            .setView(box)
+            .setPositiveButton("Generate") { _, _ ->
+                val name = nameInput.text.toString().trim()
+                val limit = limitInput.text.toString().toIntOrNull()
+                executor.execute {
+                    runCatching { client.createApiKey(adminKey, name, null, limit) }.onSuccess { pair ->
+                        runOnUiThread {
+                            showCreatedKeyDialog(pair.second)
+                            onSuccess()
+                        }
+                    }.onFailure { e ->
+                        runOnUiThread {
+                            Toast.makeText(this@MainActivity, "Creation failed: ${e.message}", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showCreatedKeyDialog(secret: String) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 16, 24, 16)
+        }
+        val warning = TextView(this).apply {
+            text = "⚠️ Save this secret immediately. The plaintext key is only shown once."
+            textSize = 12f
+            setTextColor(Color.parseColor("#FFB74D"))
+            setPadding(0, 0, 0, 10)
+        }
+        val keyText = TextView(this).apply {
+            text = secret
+            textSize = 13f
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#1B2A32"), 8)
+            setPadding(12, 12, 12, 12)
+        }
+        val copyBtn = Button(this).apply {
+            text = "📋 Copy API Key"
+            setOnClickListener {
+                copyToClipboard("Gateway API Key", secret)
+                Toast.makeText(this@MainActivity, "Key copied to clipboard", Toast.LENGTH_SHORT).show()
+            }
+        }
+        val useAsClientBtn = Button(this).apply {
+            text = "Set as App 1 Active Key"
+            setOnClickListener {
+                store.put(KEY_CLIENT_KEY, secret)
+                initClient()
+                Toast.makeText(this@MainActivity, "Active key updated", Toast.LENGTH_SHORT).show()
+            }
+        }
+        box.addView(warning)
+        box.addView(keyText)
+        box.addView(copyBtn)
+        box.addView(useAsClientBtn)
+
+        AlertDialog.Builder(this)
+            .setTitle("New API Key Generated")
+            .setView(box)
+            .setPositiveButton("Done", null)
+            .show()
+    }
+
+    private fun showImagePromptDialog() {
+        val client = api ?: run {
+            showGatewayConfigDialog()
+            return
+        }
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 16, 24, 16)
+        }
+        val promptInput = EditText(this).apply {
+            hint = "Describe the image to generate..."
+            minLines = 2
+            maxLines = 4
+        }
+        val imgPreview = ImageView(this).apply {
+            visibility = View.GONE
+            adjustViewBounds = true
+            maxHeight = (300 * resources.displayMetrics.density).toInt()
+        }
+        val statusText = TextView(this).apply {
+            textSize = 12f
+            setTextColor(Color.parseColor("#B0BEC5"))
+            setPadding(0, 8, 0, 8)
+        }
+
+        box.addView(promptInput)
+        box.addView(statusText)
+        box.addView(imgPreview)
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("AI Image Generation")
+            .setView(box)
+            .setPositiveButton("Generate", null)
+            .setNegativeButton("Close", null)
+            .create()
+
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val prompt = promptInput.text.toString().trim()
+                if (prompt.isEmpty()) return@setOnClickListener
+
+                statusText.text = "Generating image via Tor Gateway..."
+                statusText.setTextColor(Color.parseColor("#FFD54F"))
+                imgPreview.visibility = View.GONE
+
+                executor.execute {
+                    runCatching {
+                        client.generateImage("dall-e-3", prompt)
+                    }.onSuccess { bytes ->
+                        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        runOnUiThread {
+                            statusText.text = "Generated successfully"
+                            statusText.setTextColor(Color.parseColor("#81C784"))
+                            imgPreview.setImageBitmap(bmp)
+                            imgPreview.visibility = View.VISIBLE
+                        }
+                    }.onFailure { err ->
+                        runOnUiThread {
+                            statusText.text = "Failed: ${err.message}"
+                            statusText.setTextColor(Color.parseColor("#EF5350"))
+                        }
+                    }
+                }
+            }
+        }
+        dialog.show()
+    }
+
+    private fun runConnectionTest() {
+        val client = api ?: run {
+            showGatewayConfigDialog()
+            return
+        }
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 16, 24, 16)
+        }
+        val steps = listOf(
+            "1. Tor SOCKS Proxy (127.0.0.1:${client.socksPort})",
+            "2. Onion Host Reachability",
+            "3. Gateway Health Check (/health)",
+            "4. Authentication Handshake",
+            "5. Model Discovery (/v1/models)",
+            "6. End-to-End AI Ping"
+        )
+        val stepViews = steps.map { label ->
+            TextView(this).apply {
+                text = "⏳ $label"
+                textSize = 13f
+                setTextColor(Color.parseColor("#B0BEC5"))
+                setPadding(0, 6, 0, 6)
+            }
+        }
+        stepViews.forEach { box.addView(it) }
+
+        val summary = TextView(this).apply {
+            text = "Testing connection..."
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 12, 0, 0)
+            setTextColor(Color.WHITE)
+        }
+        box.addView(summary)
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Tor Connection Diagnostics")
+            .setView(box)
+            .setPositiveButton("Close", null)
+            .show()
+
+        executor.execute {
+            // Step 1: Tor SOCKS check
+            val s1 = client.testTorSocksPort()
+            runOnUiThread {
+                stepViews[0].text = if (s1) "✅ ${steps[0]} - OK" else "❌ ${steps[0]} - Failed (Start Orbot)"
+                stepViews[0].setTextColor(if (s1) Color.parseColor("#81C784") else Color.parseColor("#EF5350"))
+            }
+            if (!s1) {
+                runOnUiThread { summary.text = "Test Failed: Tor SOCKS is not listening on port ${client.socksPort}." }
+                return@execute
+            }
+
+            // Step 2 & 3: Health check (proves onion reachability and gateway up)
+            var healthOk = false
+            try {
+                client.health()
+                healthOk = true
+                runOnUiThread {
+                    stepViews[1].text = "✅ ${steps[1]} - OK"
+                    stepViews[1].setTextColor(Color.parseColor("#81C784"))
+                    stepViews[2].text = "✅ ${steps[2]} - OK"
+                    stepViews[2].setTextColor(Color.parseColor("#81C784"))
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    stepViews[1].text = "❌ ${steps[1]} - ${e.message}"
+                    stepViews[1].setTextColor(Color.parseColor("#EF5350"))
+                    stepViews[2].text = "❌ ${steps[2]} - Unreachable"
+                    stepViews[2].setTextColor(Color.parseColor("#EF5350"))
+                    summary.text = "Test Failed: Onion gateway unreachable."
+                }
+                return@execute
+            }
+
+            // Step 4 & 5: Auth and Model Discovery
+            var modelsOk = false
+            try {
+                val mList = client.models()
+                modelsOk = mList.isNotEmpty()
+                runOnUiThread {
+                    stepViews[3].text = "✅ ${steps[3]} - Authenticated"
+                    stepViews[3].setTextColor(Color.parseColor("#81C784"))
+                    stepViews[4].text = "✅ ${steps[4]} - Found ${mList.size} models"
+                    stepViews[4].setTextColor(Color.parseColor("#81C784"))
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    stepViews[3].text = "❌ ${steps[3]} - Auth Error"
+                    stepViews[3].setTextColor(Color.parseColor("#EF5350"))
+                    stepViews[4].text = "❌ ${steps[4]} - Model check failed: ${e.message}"
+                    stepViews[4].setTextColor(Color.parseColor("#EF5350"))
+                    summary.text = "Test Failed: Authentication or model discovery failed."
+                }
+                return@execute
+            }
+
+            // Step 6: Simple AI request
+            try {
+                val pingMsg = listOf(ChatMessage(role = "user", content = "Respond with the single word 'Pong'."))
+                val reply = client.chatStream(modelSpinner.selectedItem?.toString() ?: "claude-3-7-sonnet-20250219", "", pingMsg) {}
+                runOnUiThread {
+                    stepViews[5].text = "✅ ${steps[5]} - Received: ${reply.take(20).trim()}"
+                    stepViews[5].setTextColor(Color.parseColor("#81C784"))
+                    summary.text = "🎉 All 6 diagnostics passed! Tor Gateway is fully operational."
+                    summary.setTextColor(Color.parseColor("#81C784"))
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    stepViews[5].text = "❌ ${steps[5]} - ${e.message}"
+                    stepViews[5].setTextColor(Color.parseColor("#EF5350"))
+                    summary.text = "Partial Success: Gateway reachable but model query failed."
                 }
             }
         }
